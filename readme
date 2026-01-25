@@ -1,0 +1,22 @@
+# Create database
+colmap feature_extractor \
+  --database_path data/realsense_captures/my_object_scene_processed/colmap/database.db \
+  --image_path data/realsense_captures/my_object_scene_processed/images \
+  --ImageReader.single_camera 1 \
+  --ImageReader.camera_model OPENCV
+
+# Match features
+colmap exhaustive_matcher \
+  --database_path data/realsense_captures/my_object_scene_processed/colmap/database.db
+
+# Run mapper
+mkdir -p data/realsense_captures/my_object_scene_processed/colmap/sparse
+colmap mapper \
+  --database_path data/realsense_captures/my_object_scene_processed/colmap/database.db \
+  --image_path data/realsense_captures/my_object_scene_processed/images \
+  --output_path data/realsense_captures/my_object_scene_processed/colmap/sparse
+
+# Convert to nerfstudio format
+ns-process-data images \
+  --data data/realsense_captures/my_object_scene_processed \
+  --skip-colmap

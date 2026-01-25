@@ -685,6 +685,11 @@ class POGSModel(SplatfactoModel):
             clip_feats = self.gaussian_field.get_outputs_from_feature(clip_hash_encoding, self.best_scales[0].to(self.device) * torch.ones(self.num_points, 1, device=self.device))[GaussianFieldHeadNames.CLIP].to(dtype=torch.float32)
             relevancy = self.image_encoder.get_relevancy(clip_feats / (clip_feats.norm(dim=-1, keepdim=True)+1e-6), 0).view(self.num_points, -1)
             
+            if self.cluster_labels is None:
+                # If clustering hasn't been done yet, we can't label clusters. 
+                # Just return or optionally log a warning.
+                return
+
             labels = self.cluster_labels.numpy()
             avg_relevancy_per_cluster = []
             for c_id in range(0, labels.max().astype(int) + 1):
