@@ -27,34 +27,52 @@ python pogs/scripts/realsense_pogs_capture.py --scene_name my_scan_01 --frame_sk
 
 ---
 
-## 2. Processing (COLMAP)
+## 2. Processing (COLMAP) - Manual Sequence
 
-We need to compute camera poses using COLMAP. Run these 4 commands in order.
+We need to compute camera poses using COLMAP. Run these 5 commands in order.
 
-**A. Extract Features**
+**A. Create Database Directory**
+```bash
+mkdir -p data/realsense_captures/my_scan_01/colmap
+```
+
+**B. Extract Features**
 ```bash
 colmap feature_extractor \
-    --database_path data/realsense_captures/my_scan_01/database.db \
-    --image_path data/realsense_captures/my_scan_01/images
+    --database_path data/realsense_captures/my_scan_01/colmap/database.db \
+    --image_path data/realsense_captures/my_scan_01/images \
+    --SiftExtraction.use_gpu 1
 ```
 
-**B. Match Features**
+**C. Match Features (Sequential with High Overlap)**
+*We use `overlap 50` to help COLMAP find good initial pairs even if there are duplicate frames.*
 ```bash
 colmap sequential_matcher \
-    --database_path data/realsense_captures/my_scan_01/database.db
-```
-
-**C. Create Output Directory**
-```bash
-mkdir -p data/realsense_captures/my_scan_01/colmap/sparse
+    --database_path data/realsense_captures/my_scan_01/colmap/database.db \
+    --SiftMatching.use_gpu 1 \
+    --SequentialMatching.overlap 50
 ```
 
 **D. Map/Reconstruct Scene**
 ```bash
+mkdir -p data/realsense_captures/my_scan_01/colmap/sparse
 colmap mapper \
-    --database_path data/realsense_captures/my_scan_01/database.db \
+    --database_path data/realsense_captures/my_scan_01/colmap/database.db \
     --image_path data/realsense_captures/my_scan_01/images \
-    --output_path data/realsense_captures/my_scan_01/colmap/sparse
+    --output_path data/realsense_captures/my_scan_01/colmap/sparse \
+    --Mapper.ba_global_function_tolerance=1e-6
+```
+
+**E. Convert to Nerfstudio Format**
+*We use `ns-process-data` but skip the actual COLMAP steps since we just did them.*
+```bash
+# Note: Ensure your sparse output is in colmap/sparse/0 before running this.
+# If colmap created 'sparse/0', verify it with: ls data/realsense_captures/my_scan_01/colmap/sparse/0
+ns-process-data images \
+    --data data/realsense_captures/my_scan_01/images \
+    --output-dir data/realsense_captures/my_scan_01 \
+    --skip-colmap \
+    --matching-method sequential
 ```
 
 ---

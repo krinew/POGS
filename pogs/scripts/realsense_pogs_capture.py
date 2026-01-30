@@ -72,7 +72,7 @@ def main():
     intrinsics = get_intrinsics_dict(color_stream)
 
     recording = False
-    frame_count = 0
+    frame_count = 1 # Start at 1 to match Nerfstudio's 1-based indexing and avoid overwrite issues
     frames_data = [] # To store list of frames for transforms.json
     start_time = time.time()
     frame_counter = 0  # Counter for frame skipping
