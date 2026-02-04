@@ -1,6 +1,30 @@
 from typing import Optional
 import numpy as np
 
+def project_pose_to_4dof(pose_6dof, fixed_roll=0.0, fixed_pitch=1.57):
+    """
+    Project a 6-DoF SE(3) pose (4x4 matrix) to a 4-DoF pose by fixing roll and pitch, keeping x, y, z, and yaw.
+    Args:
+        pose_6dof: 4x4 numpy array or nested list (SE(3) transform)
+        fixed_roll: value (rad) to fix roll (default 0)
+        fixed_pitch: value (rad) to fix pitch (default 1.57 or ~pi/2 for Down)
+    Returns:
+        4x4 numpy array with only yaw, x, y, z preserved
+    """
+    import math
+    from scipy.spatial.transform import Rotation as R
+    pose_6dof = np.array(pose_6dof)
+    t = pose_6dof[:3, 3]
+    rot = pose_6dof[:3, :3]
+    # Extract yaw from original rotation
+    yaw = R.from_matrix(rot).as_euler('zyx')[0]
+    # Compose new rotation with fixed roll/pitch, original yaw
+    new_rot = R.from_euler('zyx', [yaw, fixed_pitch, fixed_roll]).as_matrix()
+    pose_4dof = np.eye(4)
+    pose_4dof[:3, :3] = new_rot
+    pose_4dof[:3, 3] = t
+    return pose_4dof
+
 
 class RobotInterface:
     """A thin wrapper to abstract sending commands to a UR5 robot if available.

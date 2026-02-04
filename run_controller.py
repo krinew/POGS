@@ -97,7 +97,11 @@ def main():
                 cmd = policy.propose_command(color, depth)
                 print("Proposed command:", cmd)
                 if cmd.type == "pose" and cmd.pose is not None:
-                    robot.move_pose(cmd.pose)
+                    # Project 6-DoF grasp to 4-DoF (fix roll/pitch) for OpenManipulator
+                    from pogs.controller.robot_interface import project_pose_to_4dof
+                    # Usually pi/2 (1.57) is straight down for OM-X
+                    pose_4dof = project_pose_to_4dof(cmd.pose, fixed_pitch=1.57) 
+                    robot.move_pose(pose_4dof)
                 elif cmd.type == "joint" and cmd.joints is not None:
                     robot.move_joints(cmd.joints)
         except KeyboardInterrupt:

@@ -404,17 +404,33 @@ def main(
         post_grasp_rigid_tf = RigidTransform(rotation=post_grasp_world_frame[:3,:3], translation=post_grasp_world_frame[:3,3])
         pre_grasp_rigid_tf = RigidTransform(rotation=pre_grasp_world_frame[:3,:3], translation=pre_grasp_world_frame[:3,3])
         
+        # Convert code to utilize 4-DoF projection
+        from pogs.controller.robot_interface import project_pose_to_4dof
+
         # Execute the grasp sequence
         robot.gripper.open()  # Open gripper
         time.sleep(1)
-        robot.move_pose(pre_grasp_rigid_tf, vel=0.3, acc=0.1)  # Move to pre-grasp position
+        
+        # Project pre-grasp (convert RigidTransform to matrix first if needed, but project_pose_to_4dof handles N-arrays)
+        pre_grasp_mat = pre_grasp_rigid_tf.matrix if hasattr(pre_grasp_rigid_tf, 'matrix') else pre_grasp_rigid_tf
+        pre_grasp_4dof = project_pose_to_4dof(pre_grasp_mat, fixed_pitch=1.57) # ~pi/2 down
+        robot.move_pose(pre_grasp_4dof, vel=0.3, acc=0.1)  # Move to pre-grasp position
         time.sleep(1)
+
         final_grasp_rigid_tf = RigidTransform(rotation=best_grasp[:3,:3], translation=best_grasp[:3,3])
-        robot.move_pose(final_grasp_rigid_tf, vel=0.3, acc=0.1)  # Move to grasp position
+        final_grasp_mat = final_grasp_rigid_tf.matrix if hasattr(final_grasp_rigid_tf, 'matrix') else final_grasp_rigid_tf
+        # Project main grasp
+        final_grasp_4dof = project_pose_to_4dof(final_grasp_mat, fixed_pitch=1.57)
+        robot.move_pose(final_grasp_4dof, vel=0.3, acc=0.1)  # Move to grasp position
         time.sleep(1)
+
         robot.gripper.close()  # Close gripper to grasp object
         time.sleep(1)
-        robot.move_pose(post_grasp_rigid_tf, vel=0.3, acc=0.1)  # Lift object
+        
+        post_grasp_mat = post_grasp_rigid_tf.matrix if hasattr(post_grasp_rigid_tf, 'matrix') else post_grasp_rigid_tf
+        # Project post grasp
+        post_grasp_4dof = project_pose_to_4dof(post_grasp_mat, fixed_pitch=1.57) 
+        robot.move_pose(post_grasp_4dof, vel=0.3, acc=0.1)  # Lift object
         time.sleep(1)
 
     # Lists to store frames for debugging or recording
