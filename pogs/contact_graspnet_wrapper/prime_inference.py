@@ -375,7 +375,7 @@ def modified_inference(global_config, checkpoint_dir, seg_path,full_path,boundin
     :param checkpoint_dir: checkpoint directory
     :param seg_path: .png/.npz/.npy file paths that contain depth/pointcloud and optionally intrinsics/segmentation/rgb
     :param K: Camera Matrix with intrinsics to convert depth to point cloud
-    :param local_regions: Crop 3D local regions around given segments. 
+    :param local_regions: Crndop 3D local regions arou given segments. 
     :param skip_border_objects: When extracting local_regions, ignore segments at depth map boundary.
     :param filter_grasps: Filter and assign grasp contacts according to segmap.
     :param segmap_id: only return grasps from specified segmap_id.

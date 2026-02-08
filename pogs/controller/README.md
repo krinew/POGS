@@ -1,6 +1,6 @@
 # Controller Module
 
-The `pogs/controller` module provides a unified interface for perception→action control: it ingests camera frames (RGB + depth) from a RealSense camera, runs a policy to compute motor commands, and sends commands to a robot (e.g., UR5 via `ur5py`).
+The `pogs/controller` module provides a unified interface for perception→action control: it ingests camera frames (RGB + depth) from a RealSense camera and sends commands to a robot (e.g., UR5 via `ur5py`).
 
 ## Architecture
 
@@ -11,7 +11,6 @@ The `pogs/controller` module provides a unified interface for perception→actio
   - Interactive mode: spawns the interactive capture script as a subprocess.
   - Stream mode: in-process pipeline for programmatic frame access.
 - **`Command`** (`commands.py`): Dataclass representing motor commands (joint angles or pose matrices).
-- **`SimpleDepthPolicy`** (`policy.py`): Simple perception→action policy that computes pose deltas based on mean depth in image center.
 - **`RobotInterface`** (`robot_interface.py`): Thin wrapper for sending commands to UR5 robot (graceful dry-run if hardware unavailable).
 
 ### Usage Flow
@@ -20,8 +19,6 @@ The `pogs/controller` module provides a unified interface for perception→actio
 RealSenseController.start_stream()
     ↓
 RealSenseController.get_frame()  →  (color, depth) numpy arrays
-    ↓
-SimpleDepthPolicy.propose_command(color, depth)  →  Command
     ↓
 RobotInterface.move_pose() or move_joints()
 ```
@@ -51,40 +48,9 @@ python3 run_controller.py --mode interactive \
 - **s**: save a single frame (manual trigger)
 - **q** or **ESC**: quit
 
-### 2. Policy Mode (Live Control)
+### 2. Online Control (POGS)
 
-Run the perception→action loop in real-time using RealSense frames:
-
-```bash
-python3 run_controller.py --mode policy \
-  --scene_name my_scene \
-  --save_path data/realsense_captures
-```
-
-The policy will:
-1. Capture frames from the RealSense pipeline.
-2. Compute a Cartesian pose delta based on mean depth (target: 0.5 m).
-3. Propose and send the command to the robot (or dry-run if hardware unavailable).
-4. Loop at ~10 Hz.
-
-**Press Ctrl+C** to stop.
-
-### 3. Mock Mode (Offline Testing)
-
-Replay saved frames (from a prior capture) and run the policy without hardware:
-
-```bash
-python3 run_controller.py --mode mock \
-  --scene_name my_scan_01 \
-  --save_path outputs/my_scan_01/pogs \
-  --mock_sleep 0.1
-```
-
-This mode:
-1. Loads depth `.npy` files and color `.png` files from `<save_path>/<scene_name>/depth/` and `<save_path>/<scene_name>/img/`.
-2. Cycles through saved frames at the rate specified by `--mock_sleep` (seconds).
-3. Runs the same policy on each frame.
-4. Outputs proposed commands (dry-run mode if robot unavailable).
+POGS handles online decision-making and control externally. This module focuses on camera I/O and robot command transport, not a built-in policy.
 
 ## API Reference
 
@@ -129,19 +95,6 @@ cmd = Command(type="joint", joints=[0.0, -1.57, 1.57, -1.57, 0.0, 0.0])
 json_str = cmd.to_json()
 ```
 
-### SimpleDepthPolicy
-
-```python
-from pogs.controller.policy import SimpleDepthPolicy
-import numpy as np
-
-policy = SimpleDepthPolicy(target_depth=0.5, crop_frac=0.2, z_gain=0.5)
-
-# Propose a command given color and depth frames
-cmd = policy.propose_command(color, depth)
-print(cmd.type, cmd.joints, cmd.pose)
-```
-
 ### RobotInterface
 
 ```python
@@ -166,18 +119,16 @@ pogs/controller/
 ├── __init__.py              # Exports ControllerBase, RealSenseController
 ├── commands.py              # Command dataclass
 ├── controller.py            # ControllerBase and RealSenseController
-├── policy.py                # SimpleDepthPolicy
 ├── robot_interface.py       # RobotInterface
 └── README.md                # This file
 ```
 
 ## Examples
 
-### Example 1: Run Policy in Real-Time
+### Example 1: Stream Frames and Send Commands
 
 ```python
 from pogs.controller import RealSenseController
-from pogs.controller.policy import SimpleDepthPolicy
 from pogs.controller.robot_interface import RobotInterface
 import time
 
@@ -187,16 +138,15 @@ if not rc.connect():
     exit(1)
 
 rc.start_stream()
-policy = SimpleDepthPolicy(target_depth=0.5)
 robot = RobotInterface()
 robot.connect()
 
 try:
     for _ in range(100):
         color, depth = rc.get_frame()
-        cmd = policy.propose_command(color, depth)
-        if cmd.type == "pose":
-            robot.move_pose(cmd.pose)
+        # Compute or retrieve a command from your online POGS loop
+        # cmd = ...
+        # robot.move_pose(cmd.pose) or robot.move_joints(cmd.joints)
         time.sleep(0.1)
 finally:
     rc.stop_stream()
@@ -208,49 +158,30 @@ finally:
 import os
 import numpy as np
 import cv2
-from pogs.controller.policy import SimpleDepthPolicy
 from pogs.controller.robot_interface import RobotInterface
 
 depth_dir = "outputs/my_scan_01/pogs/depth"
 img_dir = "outputs/my_scan_01/pogs/img"
 
 depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith('.npy')])
-policy = SimpleDepthPolicy()
 robot = RobotInterface()
 robot.connect()
 
 for depth_file in depth_files[:10]:
     depth = np.load(os.path.join(depth_dir, depth_file))
     color = cv2.imread(os.path.join(img_dir, depth_file.replace('.npy', '.png')))
-    cmd = policy.propose_command(color, depth)
-    print(f"Frame {depth_file}: {cmd}")
-    if cmd.type == "pose":
-        robot.move_pose(cmd.pose)
+    # Compute or retrieve a command from your online POGS loop
+    # cmd = ...
+    # robot.move_pose(cmd.pose) or robot.move_joints(cmd.joints)
 ```
 
 ## Extending the Controller
 
-To implement a custom policy, subclass `SimpleDepthPolicy` or create a new class with a `propose_command(color, depth) -> Command` method:
-
-```python
-from pogs.controller.policy import SimpleDepthPolicy
-from pogs.controller.commands import Command
-import numpy as np
-
-class CustomPolicy(SimpleDepthPolicy):
-    def propose_command(self, color, depth):
-        # Your perception logic here
-        # e.g., run a neural network on color+depth
-        # return Command(type="pose", pose=...) or Command(type="joint", joints=...)
-        pass
-```
-
-Then pass your custom policy to the controller loop in `run_controller.py`.
+Implement your online POGS loop externally and call `RobotInterface.move_pose()` or `RobotInterface.move_joints()` with the commands it produces.
 
 ## Troubleshooting
 
 - **"RealSense available: False"**: RealSense library (`pyrealsense2`) not installed or no device detected. Try `pip install pyrealsense2` or check USB connection.
-- **"No depth .npy files found"**: Mock mode couldn't find saved frames. Ensure `--save_path/--scene_name/depth/` directory exists with `.npy` files.
 - **Robot connection fails**: `ur5py` not installed or UR5 not reachable on network. Commands will run in dry-run mode.
 
 ## License

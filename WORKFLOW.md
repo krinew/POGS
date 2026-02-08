@@ -68,6 +68,8 @@ colmap mapper \
 ```bash
 # Note: Ensure your sparse output is in colmap/sparse/0 before running this.
 # If colmap created 'sparse/0', verify it with: ls data/realsense_captures/my_scan_01/colmap/sparse/0
+
+#from this only extract the transforma.JSON delete the images created by this keep a copy of images or dataset before hand images created by this are duplicates and hence yield no result.
 ns-process-data images \
     --data data/realsense_captures/my_scan_01/images \
     --output-dir data/realsense_captures/my_scan_01 \

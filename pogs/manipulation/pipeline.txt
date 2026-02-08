@@ -1,0 +1,10 @@
+1. Scene Capture & POGS Build     → 3D scene representation
+2. Object Segmentation            → DETIC + POGS clustering
+3. Object Extraction              → Get point cloud from 3D Gaussians
+4. Grasp Planning                 → ContactGraspNet (you have this)
+5. Grasp Filtering & Selection    → Project to 4-DOF, collision check
+6. Motion Planning                → Trajectory to grasp pose
+7. Pick Execution                 → Move, grasp, lift
+8. Place Planning                 → Plan placement location
+9. Place Execution                → Move, release, retract
+10. Online Tracking               → Update POGS during manipulation
