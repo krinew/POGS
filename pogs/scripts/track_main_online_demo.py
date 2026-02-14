@@ -1,28 +1,58 @@
 import torch
+import sys
+import os
+
+# Add project root to sys.path to allow imports from pogs package
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../"))
+
 import viser
 import viser.transforms as vtf
 import time
-import pyzed.sl as sl
+# import pyzed.sl as sl
 import numpy as np
 import tyro
 from pathlib import Path
 from autolab_core import RigidTransform
-from pogs.tracking.tri_zed import Zed
+from pogs.tracking.realsense_wrapper import RealSense as Zed
 from pogs.tracking.optim import Optimizer
 import warp as wp
 from pogs.encoders.openclip_encoder import OpenCLIPNetworkConfig, OpenCLIPNetwork
 from pogs.tracking.toad_object import ToadObject
 import yaml
 import os
-from ur5py.ur5 import UR5Robot
+# from ur5py.ur5 import UR5Robot
+from pogs.controller.open_manipulator import OpenManipulatorRobot
 import open3d as o3d
 
 # Path to the directory containing this script
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 # Pre-calibrated transforms between coordinate frames
-WORLD_TO_ZED2 = RigidTransform.load(dir_path+"/../calibration_outputs/world_to_extrinsic_zed.tf")
-WRIST_TO_CAM = RigidTransform.load(dir_path + "/../calibration_outputs/wrist_to_zed_mini.tf")
+def _load_rigid_transform(path: str, default: RigidTransform, name: str) -> RigidTransform:
+    try:
+        return RigidTransform.load(path)
+    except FileNotFoundError:
+        print(f"[WARN] Missing {name} transform at {path}. Using identity.")
+        return default
+
+_identity_world_cam = RigidTransform()
+_identity_world_cam.from_frame = "world"
+_identity_world_cam.to_frame = "camera"
+
+WORLD_TO_ZED2 = _load_rigid_transform(
+    dir_path + "/../calibration_outputs/world_to_extrinsic_zed_for_grasping_down.tf",
+    _identity_world_cam,
+    "WORLD_TO_ZED2",
+)
+
+_identity_wrist_cam = RigidTransform()
+_identity_wrist_cam.from_frame = "wrist"
+_identity_wrist_cam.to_frame = "camera"
+WRIST_TO_CAM = _load_rigid_transform(
+    dir_path + "/../calibration_outputs/wrist_to_zed_mini.tf",
+    _identity_wrist_cam,
+    "WRIST_TO_CAM",
+)
 
 DEVICE = 'cuda:0'
 
@@ -149,6 +179,7 @@ def plot_gripper_pro_max(center, R, width, depth, score=1, color=None):
 
 def main(
     config_path: Path = Path("/home/lifelong/pogs/pogs/data/utils/datasets/outputs/20250305_prime_drill/pogs/2025-03-05_180006/config.yml"),
+    dry_run: bool = False,
 ):
     """
     Main function for the POGS (Perception for Object Grasping System) demo.
@@ -184,27 +215,83 @@ def main(
     with open(config_filepath, 'r') as file:
         camera_parameters = yaml.safe_load(file)
 
-    # Initialize ZED camera with parameters from config
-    zed = Zed(flip_mode=camera_parameters['third_view_zed']['flip_mode'],
-              resolution=camera_parameters['third_view_zed']['resolution'],
-              fps=camera_parameters['third_view_zed']['fps'],
-              cam_id=camera_parameters['third_view_zed']['id'])
+    class _DummyCamera:
+        def __init__(self, resolution: str = "720p"):
+            if resolution == "1080p":
+                self.width, self.height = 1920, 1080
+            elif resolution == "2k":
+                self.width, self.height = 2208, 1242
+            else:
+                self.width, self.height = 1280, 720
+            self.raft_lock = None
+            self.zed_mesh = None
+            self.cam_to_zed = RigidTransform()
+
+        def get_K(self):
+            fx = fy = 600.0
+            cx = self.width / 2.0
+            cy = self.height / 2.0
+            return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+
+        def get_frame(self, depth=True):
+            rgb = torch.zeros((self.height, self.width, 3), dtype=torch.uint8, device="cuda")
+            d = torch.zeros((self.height, self.width), dtype=torch.float32, device="cuda")
+            return rgb, None, d
+
+    # Initialize camera with parameters from config
+    if dry_run:
+        print("[DRY RUN] Using dummy camera frames. No RealSense required.")
+        zed = _DummyCamera(resolution=camera_parameters['third_view_zed']['resolution'])
+    else:
+        zed = Zed(flip_mode=camera_parameters['third_view_zed']['flip_mode'],
+                  resolution=camera_parameters['third_view_zed']['resolution'],
+                  fps=camera_parameters['third_view_zed']['fps'],
+                  cam_id=camera_parameters['third_view_zed']['id'])
     
     # Apply camera settings from capture session to ensure consistency
-    zed.cam.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, camera_parameters['third_view_zed']['exposure'])
-    zed.cam.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, camera_parameters['third_view_zed']['gain'])
+    # zed.cam.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, camera_parameters['third_view_zed']['exposure'])
+    # zed.cam.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, camera_parameters['third_view_zed']['gain'])
 
     time.sleep(1.0)  # Allow camera to initialize
     
+    class _DummyGripper:
+        def open(self):
+            print("[DRY RUN] Gripper open")
+
+        def close(self):
+            print("[DRY RUN] Gripper close")
+
+    class _DummyRobot:
+        def __init__(self):
+            self.gripper = _DummyGripper()
+
+        def move_joint(self, joints, vel=1.0, acc=0.1):
+            print(f"[DRY RUN] move_joint: {joints} vel={vel} acc={acc}")
+
+        def move_pose(self, pose, vel=0.3, acc=0.1):
+            print(f"[DRY RUN] move_pose: vel={vel} acc={acc}")
+
+        def get_pose(self):
+            class _Pose:
+                def __init__(self):
+                    self.matrix = np.eye(4)
+            return _Pose()
+
     # Initialize robot arm
-    robot = UR5Robot(gripper=1)
-    clear_tcp(robot)
+    if dry_run:
+        print("[DRY RUN] Using dummy robot. No OpenManipulator required.")
+        robot = _DummyRobot()
+    else:
+        print("Initializing OpenManipulator...")
+        robot = OpenManipulatorRobot(gripper=True)
+        # clear_tcp(robot)
     
     # Move robot to home position
-    home_joints = np.array([-1.433847729359762, -1.6635258833514612, -0.8512895742999476, -3.7683952490436, -1.4371045271502894, 3.1419787406921387])
+    # home_joints = np.array([-1.433847729359762, -1.6635258833514612, -0.8512895742999476, -3.7683952490436, -1.4371045271502894, 3.1419787406921387])
+    home_joints = np.array([0.0, -1.0, 0.3, 0.7])
     robot.move_joint(home_joints, vel=1.0, acc=0.1)
     world_to_wrist = robot.get_pose()
-    world_to_wrist.from_frame = "wrist"
+    # world_to_wrist.from_frame = "wrist"
 
     # Get camera transformation
     camera_tf = WORLD_TO_ZED2
@@ -218,29 +305,41 @@ def main(
         axes_length=0.1,
         axes_radius=0.005,
     )
-    server.add_mesh_trimesh(
-        "camera/mesh",
-        mesh=zed.zed_mesh,
-        scale=0.001,
-        position=zed.cam_to_zed.translation,
-        wxyz=zed.cam_to_zed.quaternion,
-    )
+    if zed.zed_mesh is not None:
+        server.add_mesh_trimesh(
+            "camera/mesh",
+            mesh=zed.zed_mesh,
+            scale=0.001,
+            position=zed.cam_to_zed.translation,
+            wxyz=zed.cam_to_zed.quaternion,
+        )
 
     # Get initial frame from camera
     l, _, depth = zed.get_frame(depth=True)
     
     # Initialize the neural object tracker
-    toad_opt = Optimizer(
-        config_path,
-        zed.get_K(),
-        l.shape[1],
-        l.shape[0], 
-        init_cam_pose=torch.from_numpy(
-            vtf.SE3(
-                wxyz_xyz=np.array([*camera_frame.wxyz, *camera_frame.position])
-            ).as_matrix()[None, :3, :]
-        ).float(),
-    )
+    if not config_path.exists():
+        if dry_run:
+            print(f"[DRY RUN] Config not found at {config_path}. Skipping Optimizer init.")
+            toad_opt = None
+        else:
+            raise FileNotFoundError(f"Config not found: {config_path}")
+    else:
+        toad_opt = Optimizer(
+            config_path,
+            zed.get_K(),
+            l.shape[1],
+            l.shape[0], 
+            init_cam_pose=torch.from_numpy(
+                vtf.SE3(
+                    wxyz_xyz=np.array([*camera_frame.wxyz, *camera_frame.position])
+                ).as_matrix()[None, :3, :]
+            ).float(),
+        )
+
+    if toad_opt is None:
+        print("[DRY RUN] Optimizer not initialized. Exiting after basic setup.")
+        return
 
     @opt_init_handle.on_click
     def _(_):
@@ -252,7 +351,10 @@ def main(
         opt_init_handle.disabled = True
         l, _, depth = zed.get_frame(depth=True)
         toad_opt.set_frame(l, toad_opt.cam2world_ns, depth)
-        with zed.raft_lock:
+        if zed.raft_lock is not None:
+            with zed.raft_lock:
+                toad_opt.init_obj_pose()
+        else:
             toad_opt.init_obj_pose()
         query_handle.disabled = False
         
@@ -404,34 +506,67 @@ def main(
         post_grasp_rigid_tf = RigidTransform(rotation=post_grasp_world_frame[:3,:3], translation=post_grasp_world_frame[:3,3])
         pre_grasp_rigid_tf = RigidTransform(rotation=pre_grasp_world_frame[:3,:3], translation=pre_grasp_world_frame[:3,3])
         
-        # Convert code to utilize 4-DoF projection
+        # Convert code to utilize 4-DoF projection with pitch clamping
         from pogs.controller.robot_interface import project_pose_to_4dof
+        from pogs.manipulation.grasp_utils import interpolate_poses
+        
+        # 4-DoF constraints: roll=0, pitch clamped to downward-facing range
+        PITCH_RANGE = (-np.pi/2 - 0.3, -np.pi/2 + 0.3)  # roughly pointing down
+        MOTION_VEL = 0.25
+        MOTION_ACC = 0.1
+        TRAJECTORY_STEPS = 5  # interpolation waypoints
 
         # Execute the grasp sequence
         robot.gripper.open()  # Open gripper
-        time.sleep(1)
+        time.sleep(0.5)
         
-        # Project pre-grasp (convert RigidTransform to matrix first if needed, but project_pose_to_4dof handles N-arrays)
-        pre_grasp_mat = pre_grasp_rigid_tf.matrix if hasattr(pre_grasp_rigid_tf, 'matrix') else pre_grasp_rigid_tf
-        pre_grasp_4dof = project_pose_to_4dof(pre_grasp_mat, fixed_pitch=1.57) # ~pi/2 down
-        robot.move_pose(pre_grasp_4dof, vel=0.3, acc=0.1)  # Move to pre-grasp position
-        time.sleep(1)
+        # Get current robot pose as start for trajectory
+        current_pose = robot.get_pose()
+        if hasattr(current_pose, 'matrix'):
+            current_pose = current_pose.matrix
+        else:
+            current_pose = np.array(current_pose) if current_pose is not None else np.eye(4)
+        
+        # Project pre-grasp to 4-DoF
+        pre_grasp_mat = pre_grasp_rigid_tf.matrix if hasattr(pre_grasp_rigid_tf, 'matrix') else np.array(pre_grasp_rigid_tf)
+        pre_grasp_4dof = project_pose_to_4dof(pre_grasp_mat, pitch_range=PITCH_RANGE)
+        
+        # Interpolate trajectory to pre-grasp
+        print("[Grasp] Moving to pre-grasp position...")
+        traj_to_pregrasp = interpolate_poses(current_pose, pre_grasp_4dof, num_steps=TRAJECTORY_STEPS)
+        for waypoint in traj_to_pregrasp:
+            robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+        time.sleep(0.3)
 
+        # Project main grasp to 4-DoF
         final_grasp_rigid_tf = RigidTransform(rotation=best_grasp[:3,:3], translation=best_grasp[:3,3])
-        final_grasp_mat = final_grasp_rigid_tf.matrix if hasattr(final_grasp_rigid_tf, 'matrix') else final_grasp_rigid_tf
-        # Project main grasp
-        final_grasp_4dof = project_pose_to_4dof(final_grasp_mat, fixed_pitch=1.57)
-        robot.move_pose(final_grasp_4dof, vel=0.3, acc=0.1)  # Move to grasp position
-        time.sleep(1)
-
-        robot.gripper.close()  # Close gripper to grasp object
-        time.sleep(1)
+        final_grasp_mat = final_grasp_rigid_tf.matrix if hasattr(final_grasp_rigid_tf, 'matrix') else np.array(final_grasp_rigid_tf)
+        final_grasp_4dof = project_pose_to_4dof(final_grasp_mat, pitch_range=PITCH_RANGE)
         
-        post_grasp_mat = post_grasp_rigid_tf.matrix if hasattr(post_grasp_rigid_tf, 'matrix') else post_grasp_rigid_tf
-        # Project post grasp
-        post_grasp_4dof = project_pose_to_4dof(post_grasp_mat, fixed_pitch=1.57) 
-        robot.move_pose(post_grasp_4dof, vel=0.3, acc=0.1)  # Lift object
-        time.sleep(1)
+        # Move from pre-grasp to grasp (short linear motion)
+        print("[Grasp] Approaching grasp position...")
+        traj_to_grasp = interpolate_poses(pre_grasp_4dof, final_grasp_4dof, num_steps=3)
+        for waypoint in traj_to_grasp:
+            robot.move_pose(waypoint, vel=MOTION_VEL * 0.5, acc=MOTION_ACC)  # slower approach
+        time.sleep(0.3)
+
+        # Close gripper
+        print("[Grasp] Closing gripper...")
+        robot.gripper.close()
+        time.sleep(0.8)
+        
+        # Project post-grasp (lift) to 4-DoF
+        post_grasp_mat = post_grasp_rigid_tf.matrix if hasattr(post_grasp_rigid_tf, 'matrix') else np.array(post_grasp_rigid_tf)
+        post_grasp_4dof = project_pose_to_4dof(post_grasp_mat, pitch_range=PITCH_RANGE)
+        
+        # Lift object
+        print("[Grasp] Lifting object...")
+        traj_to_lift = interpolate_poses(final_grasp_4dof, post_grasp_4dof, num_steps=3)
+        for waypoint in traj_to_lift:
+            robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+        time.sleep(0.5)
+        
+        print("[Grasp] Pick complete!")
 
     # Lists to store frames for debugging or recording
     real_frames = []
@@ -455,7 +590,10 @@ def main(
                 
                 # Run optimization iterations
                 n_opt_iters = 25
-                with zed.raft_lock:
+                if zed.raft_lock is not None:
+                    with zed.raft_lock:
+                        outputs = toad_opt.step_opt(niter=n_opt_iters)
+                else:
                     outputs = toad_opt.step_opt(niter=n_opt_iters)
 
                 # Add current camera image to visualization
