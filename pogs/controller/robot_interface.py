@@ -1,29 +1,49 @@
 from typing import Optional
 import numpy as np
+import math
+from scipy.spatial.transform import Rotation as R
 
-def project_pose_to_4dof(pose_6dof, fixed_roll=0.0, fixed_pitch=1.57):
+
+#This function converts a 6-DOF grasp into a 4-DOF-feasible grasp while preserving motion freedom by clamping pitch instead of freezing it.
+def project_pose_to_4dof(
+    pose_6dof,
+    fixed_roll: float = 0.0,
+    fixed_pitch: float | None = None,
+    pitch_range: tuple[float, float] | None = (-1.57, 1.57),
+):
     """
     Project a 6-DoF SE(3) pose (4x4 matrix) to a 4-DoF pose by fixing roll and pitch, keeping x, y, z, and yaw.
     Args:
         pose_6dof: 4x4 numpy array or nested list (SE(3) transform)
         fixed_roll: value (rad) to fix roll (default 0)
-        fixed_pitch: value (rad) to fix pitch (default 1.57 or ~pi/2 for Down)
+        fixed_pitch: value (rad) to fix pitch (default None to use the original pitch)
+        pitch_range: (min_pitch, max_pitch) to clamp the pitch if fixed_pitch is None
     Returns:
         4x4 numpy array with only yaw, x, y, z preserved
     """
-    import math
-    from scipy.spatial.transform import Rotation as R
     pose_6dof = np.array(pose_6dof)
     t = pose_6dof[:3, 3]
     rot = pose_6dof[:3, :3]
-    # Extract yaw from original rotation
-    yaw = R.from_matrix(rot).as_euler('zyx')[0]
-    # Compose new rotation with fixed roll/pitch, original yaw
-    new_rot = R.from_euler('zyx', [yaw, fixed_pitch, fixed_roll]).as_matrix()
+    # Extract yaw and pitch from original rotation
+    yaw, pitch, _roll = R.from_matrix(rot).as_euler('zyx')
+
+    if fixed_pitch is None:
+        if pitch_range is not None:
+            # We want to check all equivalent pitches (pitch, pitch + 2pi, pitch - 2pi...)
+            # But euler angles usually come normalized.
+            # Simple clamping:
+            pitch = float(np.clip(pitch, pitch_range[0], pitch_range[1]))
+    else:
+        pitch = float(fixed_pitch)
+
+    # Compose new rotation with fixed roll and chosen pitch, original yaw
+    new_rot = R.from_euler('zyx', [yaw, pitch, fixed_roll]).as_matrix()
     pose_4dof = np.eye(4)
     pose_4dof[:3, :3] = new_rot
     pose_4dof[:3, 3] = t
     return pose_4dof
+
+
 
 
 class RobotInterface:
@@ -89,3 +109,22 @@ class RobotInterface:
         except Exception as e:
             print(f"[RobotInterface] Error sending joints: {e}")
             return False
+
+    def get_tcp_pose(self) -> np.ndarray:
+        """Returns the current TCP pose as a 4x4 numpy matrix."""
+        if self.robot is None:
+            # Dry-run: return a dummy pose (e.g. at origin/safe home)
+            print("[RobotInterface] DRY-RUN get_tcp_pose: returning identity")
+            return np.eye(4)
+            
+        try:
+            if hasattr(self.robot, 'get_pose'):
+                pose = self.robot.get_pose()
+                if hasattr(pose, 'matrix'): return pose.matrix
+                return np.array(pose)
+            else:
+                print("[RobotInterface] robot has no get_pose — returning identity")
+                return np.eye(4)
+        except Exception as e:
+            print(f"[RobotInterface] Error getting pose: {e}")
+            return np.eye(4)

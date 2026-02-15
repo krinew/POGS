@@ -57,21 +57,37 @@ class PickAndPlaceController:
         self.current_object: Optional[ToadObject] = None
         self.optimizer: Optional[RigidGroupOptimizer] = None
         
-    def capture_and_build_scene(self) -> np.ndarray:
+    def load_scene_model(self, config_path: Path):
         """
-        Capture frames and build POGS 3D representation.
+        Load a trained POGS model from a config file.
         
-        Returns:
-            Point cloud of the scene (N, 3) in meters
+        Args:
+            config_path: Path to the config.yml file from 'ns-train pogs'
         """
-        logger.info("Starting scene capture for POGS initialization...")
+        logger.info(f"Loading POGS model from: {config_path}")
+        from nerfstudio.utils.eval_utils import eval_setup
         
-        # TODO: Implement scene capture loop
-        # - Move robot to observation pose
-        # - Capture multiple views with RealSense
-        # - Feed to POGS for 3D Gaussian Splatting optimization
-        # - Return reconstructed point cloud
+        # Load pipeline from config
+        self.config_path = config_path
+        self.config, self.pogs_pipeline, _ = eval_setup(config_path, test_mode="inference")
         
+        # Access the underlying model
+        self.model = self.pogs_pipeline.model
+        logger.info("POGS model loaded successfully.")
+
+    def update_tracking(self):
+        """
+        Run a tracking step using RigidGroupOptimizer to update object poses.
+        Requires the robot to hold the camera viewing the scene.
+        """
+        if self.optimizer is None:
+            # Initialize optimizer if needed
+            # This requires defining group masks/labels which comes from segmentation
+            pass
+        
+        # TODO: Get current frame from camera and step optimizer
+        # frame = self.camera.get_frame()
+        # self.optimizer.step(frame)
         pass
     
     def segment_and_extract_object(
@@ -168,52 +184,111 @@ class PickAndPlaceController:
             List of waypoint poses
         """
         logger.info("Planning pick trajectory...")
+        from pogs.manipulation.grasp_utils import get_approach_pose, interpolate_poses
         
-        # TODO: Implement simple trajectory planning
-        # - For 4-DOF: linear interpolation with orientation constraint
-        # - Add approach waypoint (approach_distance away)
-        # - Check for collisions at each waypoint
+        traj = []
         
-        pass
+        # 1. Determine Approach Pose (back off from grasp)
+        approach_dist = self.config.get("approach_distance", 0.05)
+        # Assuming Z is the gripper approach axis
+        approach_pose = get_approach_pose(grasp_pose_4dof, distance=approach_dist)
+        
+        # 2. Safety Lift (if currently low or needing to clear obstacles)
+        # Simple heuristic: If lower than safe Z, lift up first
+        safe_z = 0.2 # meters
+        curr_z = current_pose[2, 3]
+        target_z = approach_pose[2, 3]
+        
+        start_node = current_pose
+        
+        if curr_z < safe_z and target_z < safe_z:
+            lift_pose = current_pose.copy()
+            lift_pose[2, 3] = max(curr_z, safe_z)
+            # Add lift segment
+            traj.extend(interpolate_poses(current_pose, lift_pose, num_steps=5))
+            start_node = lift_pose
+        
+        # 3. Move to Approach Pose (Air move)
+        # This move is less critical to be perfectly linear, but smooth is good
+        traj.extend(interpolate_poses(start_node, approach_pose, num_steps=15))
+        
+        # 4. Approach to Grasp (Linear Descent)
+        traj.extend(interpolate_poses(approach_pose, grasp_pose_4dof, num_steps=10))
+        
+        return traj
     
     def execute_pick(
         self,
         grasp_pose_4dof: np.ndarray,
+        trajectory: Optional[List[np.ndarray]] = None,
         lift_height: float = None
     ) -> bool:
         """
-        Execute pick: move to grasp, close gripper, lift.
+        Execute pick: follow trajectory (if provided), grasp, and lift.
         
         Args:
             grasp_pose_4dof: Target grasp pose (4-DOF)
+            trajectory: List of waypoint poses to reach grasp
             lift_height: How high to lift after grasping
             
         Returns:
             True if successful, False otherwise
         """
         if lift_height is None:
-            lift_height = self.config["lift_height"]
+            lift_height = self.config.get("lift_height", 0.1)
         
-        logger.info("Executing pick...")
+        logger.info("Executing pick sequence...")
         
         try:
-            # TODO: Implement pick execution
-            # 1. Move to grasp pose
-            self.robot.move_pose(grasp_pose_4dof)
+            # 1. Execute Motion Trajectory (if provided)
+            # This gets us from current pose -> approach -> grasp
+            if trajectory:
+                logger.info(f"Following trajectory with {len(trajectory)} waypoints...")
+                for i, pose in enumerate(trajectory):
+                    # Use servoL or moveL depending on density, here we use standard move_pose
+                    # For smoother motion, you might want to bundle these on the robot side
+                    self.robot.move_pose(pose, vel=0.25, acc=0.5)
+            else:
+                logger.warning("No trajectory provided, moving directly to grasp pose!")
+                self.robot.move_pose(grasp_pose_4dof)
             
-            # 2. Close gripper
+            # Ensure we are fully at the grasp pose
+            # (Optional: small refinement or wait)
+            import time
+            time.sleep(0.5)
+            
+            # 2. Close Gripper
+            logger.info("Closing gripper...")
             self._set_gripper(self.config["gripper_closed_value"])
+            time.sleep(0.5) # Wait for grasp to settle
             
-            # 3. Lift
+            # 3. Lift Object
+            logger.info(f"Lifting object by {lift_height}m...")
             lift_pose = grasp_pose_4dof.copy()
             lift_pose[2, 3] += lift_height
-            self.robot.move_pose(lift_pose)
+            
+            # We can interpolate the lift too for smoothness
+            from pogs.manipulation.grasp_utils import interpolate_poses
+            lift_traj = interpolate_poses(grasp_pose_4dof, lift_pose, num_steps=5)
+            for pose in lift_traj:
+                self.robot.move_pose(pose, vel=0.1, acc=0.5)
             
             logger.info("Pick executed successfully!")
             return True
+            
         except Exception as e:
             logger.error(f"Pick execution failed: {e}")
-            self._set_gripper(self.config["gripper_open_value"])  # Safety: open gripper
+            logger.info("Attempting emergency release...")
+            self._set_gripper(self.config["gripper_open_value"])
+            
+            # Attempt to retreat straight up
+            try:
+                current = self.robot.get_tcp_pose() # Assuming implemented
+                retreat = current.copy()
+                retreat[2, 3] += 0.05
+                self.robot.move_pose(retreat)
+            except:
+                pass
             return False
     
     def execute_place(
@@ -310,9 +385,17 @@ class PickAndPlaceController:
             logger.info(f"Selected grasp with score: {grasp_score:.3f}")
             
             # 6. Plan and execute pick
-            current_pose = self.robot.get_tcp_pose()
+            # Ideally get current pose from robot, or assume last command
+            if hasattr(self.robot, "get_tcp_pose"):
+                 current_pose = self.robot.get_tcp_pose()
+            else:
+                 # Fallback if get_tcp_pose not available, assume some start or use grasp approach
+                 logger.warning("Robot interface missing get_tcp_pose(), assuming safe start.")
+                 current_pose = grasp_pose_4dof.copy()
+                 current_pose[2, 3] = 0.3 # High z start
+            
             pick_traj = self.plan_pick_trajectory(current_pose, grasp_pose_4dof)
-            pick_success = self.execute_pick(grasp_pose_4dof)
+            pick_success = self.execute_pick(grasp_pose_4dof, trajectory=pick_traj)
             if not pick_success:
                 return False
             

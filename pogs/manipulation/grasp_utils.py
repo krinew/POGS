@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from typing import List, Tuple, Optional
 import logging
+from scipy.spatial.transform import Rotation as R, Slerp
 
 logger = logging.getLogger(__name__)
 
@@ -163,42 +164,58 @@ def select_best_grasp(
     return best_grasp, best_score
 
 
+def interpolate_poses(
+    start_pose: np.ndarray,
+    end_pose: np.ndarray,
+    num_steps: int = 10,
+) -> List[np.ndarray]:
+    """Generates a list of poses interpolating linearly between start and end (SLERP for rotation)."""
+    if num_steps <= 1:
+        return [end_pose]
+
+    times = np.linspace(0, 1, num_steps)
+    
+    # Position interpolation
+    pos_start = start_pose[:3, 3]
+    pos_end = end_pose[:3, 3]
+    positions = np.outer(1 - times, pos_start) + np.outer(times, pos_end)
+    
+    # Rotation interpolation
+    rots = R.from_matrix([start_pose[:3, :3], end_pose[:3, :3]])
+    slerp = Slerp([0, 1], rots)
+    interp_rots = slerp(times)
+    
+    waypoints = []
+    for i in range(num_steps):
+        pose = np.eye(4)
+        pose[:3, :3] = interp_rots[i].as_matrix()
+        pose[:3, 3] = positions[i]
+        waypoints.append(pose)
+    return waypoints
+
+def get_approach_pose(
+    target_pose: np.ndarray,
+    distance: float = 0.05,
+    approach_axis: np.ndarray = np.array([0, 0, 1]) 
+) -> np.ndarray:
+    """Calculates a pose 'distance' meters back from target along the local approach axis."""
+    offset_mat = np.eye(4)
+    # Move backwards along the approach axis
+    offset_mat[:3, 3] = -approach_axis * distance 
+    result = target_pose @ offset_mat
+    return result
+
 def plan_linear_trajectory(
     start_pose: np.ndarray,
     end_pose: np.ndarray,
     num_waypoints: int = 10,
-    approach_distance: float = 0.05,
+    approach_distance: float = 0.0,
 ) -> List[np.ndarray]:
     """
-    Plan linear trajectory with approach phase.
-    
-    Args:
-        start_pose: (4, 4) starting pose
-        end_pose: (4, 4) target pose
-        num_waypoints: Number of interpolation steps
-        approach_distance: Distance to approach before final pose
-        
-    Returns:
-        List of (4, 4) waypoint poses
+    Plan linear trajectory. Note: approach_distance is deprecated here, handled in planner.
+    This now serves as a wrapper for interpolate_poses.
     """
-    waypoints = []
-    
-    # Approach waypoint
-    approach_pose = end_pose.copy()
-    approach_pose[2, 3] += approach_distance
-    
-    # Interpolate from start to approach
-    for i in range(num_waypoints):
-        t = i / (num_waypoints - 1)
-        interp_pose = start_pose.copy()
-        interp_pose[:3, 3] = (1 - t) * start_pose[:3, 3] + t * approach_pose[:3, 3]
-        # TODO: Interpolate rotation smoothly (SLERP)
-        waypoints.append(interp_pose)
-    
-    # Final grasp pose
-    waypoints.append(end_pose)
-    
-    return waypoints
+    return interpolate_poses(start_pose, end_pose, num_steps=num_waypoints)
 
 
 def compute_place_location(
