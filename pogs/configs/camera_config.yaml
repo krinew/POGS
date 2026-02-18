@@ -3,8 +3,8 @@ third_view_zed:
   flip_mode: false
   fps: 30
   gain: 31
-  id: 22008760
-  resolution: 1080p
+  id: 207322250030
+  resolution: 480p
 wrist_mounted_zed:
   exposure: 67
   flip_mode: true

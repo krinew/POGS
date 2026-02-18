@@ -1,6 +1,202 @@
 import time
 import numpy as np
 import math
+import os
+import sys
+from typing import Optional
+
+# Optional LeRobot OMX backend (BTP_OMX_Lerobot)
+_LEROBOT_SRC = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../BTP_OMX_Lerobot/lerobot/src")
+)
+if os.path.isdir(_LEROBOT_SRC) and _LEROBOT_SRC not in sys.path:
+    sys.path.append(_LEROBOT_SRC)
+
+try:
+    from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+    from lerobot.motors.dynamixel import DynamixelMotorsBus, OperatingMode
+    _HAS_LEROBOT = True
+except Exception:
+    _HAS_LEROBOT = False
+
+
+# Motor IDs for Leader arm (21-25) vs Follower arm (1-5)
+LEADER_MOTOR_IDS = {
+    "shoulder_pan": 21,
+    "shoulder_lift": 22,
+    "elbow_flex": 23,
+    "wrist_flex": 24,
+    "gripper": 25,
+}
+
+FOLLOWER_MOTOR_IDS = {
+    "shoulder_pan": 1,
+    "shoulder_lift": 2,
+    "elbow_flex": 3,
+    "wrist_flex": 4,
+    "gripper": 5,
+}
+
+
+class OpenManipulatorLeRobot:
+    """
+    OpenManipulator wrapper using direct DynamixelMotorsBus.
+    Supports both Leader (IDs 21-25) and Follower (IDs 1-5) motor configurations.
+
+    Normalized inputs:
+      - shoulder_pan: degrees
+      - shoulder_lift, elbow_flex, wrist_flex: range [-100, 100]
+      - gripper: range [0, 100]
+    """
+
+    def __init__(
+        self,
+        port: str = "/dev/ttyUSB0",
+        robot_id: str = "lead",
+        calibration_dir: Optional[str] = None,
+        input_mode: str = "radians",
+        joint_range_deg: Optional[list[float]] = None,
+        use_leader_ids: bool = True,
+    ):
+        if not _HAS_LEROBOT:
+            raise ImportError("LeRobot OMX backend not available. Ensure BTP_OMX_Lerobot is present.")
+
+        self.input_mode = input_mode
+        self.joint_range_deg = joint_range_deg or [360.0, 180.0, 180.0, 180.0]
+        self.port = port
+        self.robot_id = robot_id
+
+        # Choose motor IDs based on configuration
+        motor_ids = LEADER_MOTOR_IDS if use_leader_ids else FOLLOWER_MOTOR_IDS
+
+        # Load calibration if available
+        calibration = None
+        if calibration_dir:
+            from pathlib import Path
+            import json
+            cal_path = Path(calibration_dir) / f"{robot_id}.json"
+            if cal_path.exists():
+                with open(cal_path) as f:
+                    cal_data = json.load(f)
+                calibration = {
+                    motor: MotorCalibration(**data) for motor, data in cal_data.items()
+                }
+        
+        # If no calibration_dir specified, try default leader calibration
+        if calibration is None and use_leader_ids:
+            from pathlib import Path
+            import json
+            default_cal = Path(_LEROBOT_SRC) / "lerobot/teleoperators/omx_leader/calibration" / f"{robot_id}.json"
+            if default_cal.exists():
+                with open(default_cal) as f:
+                    cal_data = json.load(f)
+                calibration = {
+                    motor: MotorCalibration(**data) for motor, data in cal_data.items()
+                }
+
+        # Create motor bus with chosen IDs
+        self.bus = DynamixelMotorsBus(
+            port=port,
+            motors={
+                "shoulder_pan": Motor(motor_ids["shoulder_pan"], "xm430-w350", MotorNormMode.DEGREES),
+                "shoulder_lift": Motor(motor_ids["shoulder_lift"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+                "elbow_flex": Motor(motor_ids["elbow_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+                "wrist_flex": Motor(motor_ids["wrist_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+                "gripper": Motor(motor_ids["gripper"], "xm430-w350", MotorNormMode.RANGE_0_100),
+            },
+            calibration=calibration,
+        )
+        self.bus.apply_drive_mode = False
+        
+        # Connect and configure for position control
+        self._connect_and_configure()
+
+    def _connect_and_configure(self):
+        """Connect to motors and configure for position control mode."""
+        self.bus.connect()
+        
+        # Write calibration if available
+        if self.bus.calibration:
+            self.bus.disable_torque()
+            self.bus.write_calibration(self.bus.calibration)
+        
+        # Configure for position control (required for sending commands)
+        self.bus.disable_torque()
+        for motor in self.bus.motors:
+            self.bus.write("Operating_Mode", motor, OperatingMode.EXTENDED_POSITION.value, normalize=False)
+            self.bus.write("Return_Delay_Time", motor, 0, normalize=False)
+        
+        # Enable torque for all motors
+        self.bus.enable_torque()
+        print(f"OpenManipulatorLeRobot connected on {self.port}")
+
+    class Gripper:
+        def __init__(self, parent: "OpenManipulatorLeRobot"):
+            self.parent = parent
+
+        def open(self):
+            self.parent._send_action({"gripper.pos": 100.0})
+
+        def close(self):
+            self.parent._send_action({"gripper.pos": 0.0})
+
+    @property
+    def gripper(self):
+        return OpenManipulatorLeRobot.Gripper(self)
+
+    def _send_action(self, action):
+        """Send action to motors. Action keys should be like 'shoulder_pan.pos'."""
+        # Convert action format to bus format
+        goal_positions = {}
+        for key, val in action.items():
+            motor = key.replace(".pos", "")
+            if motor in self.bus.motors:
+                goal_positions[motor] = val
+        
+        if goal_positions:
+            self.bus.sync_write("Goal_Position", goal_positions)
+        return action
+
+    def _map_joint_inputs(self, joints: list[float]) -> dict[str, float]:
+        if len(joints) < 4:
+            raise ValueError("Expected 4 joint values")
+
+        if self.input_mode == "normalized":
+            # [shoulder_pan_deg, lift_norm, elbow_norm, wrist_norm]
+            shoulder_pan = joints[0]
+            shoulder_lift = joints[1]
+            elbow_flex = joints[2]
+            wrist_flex = joints[3]
+        else:
+            # Assume radians and map to normalized ranges
+            shoulder_pan = np.degrees(joints[0])
+            shoulder_lift = (np.degrees(joints[1]) / (self.joint_range_deg[1] / 2.0)) * 100.0
+            elbow_flex = (np.degrees(joints[2]) / (self.joint_range_deg[2] / 2.0)) * 100.0
+            wrist_flex = (np.degrees(joints[3]) / (self.joint_range_deg[3] / 2.0)) * 100.0
+
+        return {
+            "shoulder_pan.pos": float(shoulder_pan),
+            "shoulder_lift.pos": float(shoulder_lift),
+            "elbow_flex.pos": float(elbow_flex),
+            "wrist_flex.pos": float(wrist_flex),
+        }
+
+    def move_joint(self, joints, vel: float = 1.0, acc: float = 0.1):
+        action = self._map_joint_inputs(list(joints))
+        self._send_action(action)
+
+    def move_pose(self, pose, vel: float = 0.3, acc: float = 0.1):
+        raise NotImplementedError("move_pose is not supported by OpenManipulatorLeRobot")
+
+    def get_pose(self):
+        class PoseWrapper:
+            def __init__(self):
+                self.matrix = np.eye(4)
+                self.from_frame = "wrist"
+                self.to_frame = "world"
+
+        return PoseWrapper()
+
 
 try:
     from dynamixel_sdk import * 

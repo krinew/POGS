@@ -34,20 +34,75 @@ python3 pogs/scripts/calibrate_realsense_open_manipulator.py --tag-length 0.05 -
 
 What it does: uses the known wrist→tag transform for higher accuracy.
 
-## 5) Provide a valid POGS config
+## 5) Capture Scene Data (RealSense)
+
+Command:
+```bash
+python pogs/scripts/realsense_pogs_capture.py --scene_name my_scan_03 --frame_skip 1
+```
+
+What it does: captures RGB + Depth images from RealSense for POGS training.
+
+Controls:
+- **SPACE** - Toggle recording
+- **S** - Save single frame
+- **Q** - Quit
+
+Tips:
+- Move the camera slowly around the object (avoid motion blur).
+- Translate the camera, don't just rotate in place.
+- Capture 100-200 frames for good coverage.
+
+## 6) Process Data with COLMAP
+
+Command:
+```bash
+ns-process-data images \
+    --data data/realsense_captures/my_scan_03/images \
+    --output-dir data/realsense_captures/my_scan_03 \
+    --matching-method exhaustive
+```
+
+What it does: runs COLMAP to compute camera poses from the captured images.
+
+Verify: check that `data/realsense_captures/my_scan_03/transforms.json` exists and contains camera frames.
+
+## 7) Train POGS
+
+Command:
+```bash
+ns-train pogs \
+    --data data/realsense_captures/my_scan_03 \
+    --depths-path depth
+```
+
+What it does: trains the POGS model on your captured scene. The viewer will launch automatically after training.
+
+In the viewer:
+1. Click **Toggle RGB/Cluster** button.
+2. Click **Cluster Scene** button.
+3. Click on the object → **Crop to Click**.
+4. Click **Add Crop to Group List**.
+
+## 8) Provide a valid POGS config
 
 What to do:
-- Train or load a POGS scene and locate the config.yml in outputs.
+- After training, locate the config.yml in `outputs/my_scan_03/pogs/YYYY-MM-DD_HHMMSS/config.yml`.
 - Update the path in track_main_online_demo.py (config_path parameter) to the correct config.yml.
 
-## 6) Run the demo with hardware
+To re-open the viewer later:
+```bash
+ns-viewer --load-config outputs/my_scan_03/pogs/YYYY-MM-DD_HHMMSS/config.yml
+```
+
+## 9) Run the demo with hardware
 
 Command:
 python3 pogs/scripts/track_main_online_demo.py
 
 What it does: runs the full pipeline with RealSense + OpenManipulator.
 
-## 7) Viewer URL
+## 10) Viewer URL
 
 What to do:
 - Open the URL printed by Viser (default: http://0.0.0.0:8080).

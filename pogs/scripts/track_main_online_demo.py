@@ -21,7 +21,7 @@ from pogs.tracking.toad_object import ToadObject
 import yaml
 import os
 # from ur5py.ur5 import UR5Robot
-from pogs.controller.open_manipulator import OpenManipulatorRobot
+from pogs.controller.open_manipulator import OpenManipulatorLeRobot
 import open3d as o3d
 
 # Path to the directory containing this script
@@ -178,7 +178,7 @@ def plot_gripper_pro_max(center, R, width, depth, score=1, color=None):
     return gripper, colors[0]
 
 def main(
-    config_path: Path = Path("/home/lifelong/pogs/pogs/data/utils/datasets/outputs/20250305_prime_drill/pogs/2025-03-05_180006/config.yml"),
+    config_path: Path = Path("/home/pi0/POGS/outputs/my_scene/pogs/2026-01-25_230605/config.yml"),
     dry_run: bool = False,
 ):
     """
@@ -282,8 +282,8 @@ def main(
         print("[DRY RUN] Using dummy robot. No OpenManipulator required.")
         robot = _DummyRobot()
     else:
-        print("Initializing OpenManipulator...")
-        robot = OpenManipulatorRobot(gripper=True)
+        print("Initializing OpenManipulator (LeRobot)...")
+        robot = OpenManipulatorLeRobot()
         # clear_tcp(robot)
     
     # Move robot to home position
@@ -535,7 +535,11 @@ def main(
         print("[Grasp] Moving to pre-grasp position...")
         traj_to_pregrasp = interpolate_poses(current_pose, pre_grasp_4dof, num_steps=TRAJECTORY_STEPS)
         for waypoint in traj_to_pregrasp:
-            robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+            try:
+                robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+            except NotImplementedError:
+                print("[WARN] move_pose not supported by LeRobot backend. Skipping execute_grasp.")
+                return
         time.sleep(0.3)
 
         # Project main grasp to 4-DoF
@@ -547,7 +551,11 @@ def main(
         print("[Grasp] Approaching grasp position...")
         traj_to_grasp = interpolate_poses(pre_grasp_4dof, final_grasp_4dof, num_steps=3)
         for waypoint in traj_to_grasp:
-            robot.move_pose(waypoint, vel=MOTION_VEL * 0.5, acc=MOTION_ACC)  # slower approach
+            try:
+                robot.move_pose(waypoint, vel=MOTION_VEL * 0.5, acc=MOTION_ACC)  # slower approach
+            except NotImplementedError:
+                print("[WARN] move_pose not supported by LeRobot backend. Skipping execute_grasp.")
+                return
         time.sleep(0.3)
 
         # Close gripper
@@ -563,7 +571,11 @@ def main(
         print("[Grasp] Lifting object...")
         traj_to_lift = interpolate_poses(final_grasp_4dof, post_grasp_4dof, num_steps=3)
         for waypoint in traj_to_lift:
-            robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+            try:
+                robot.move_pose(waypoint, vel=MOTION_VEL, acc=MOTION_ACC)
+            except NotImplementedError:
+                print("[WARN] move_pose not supported by LeRobot backend. Skipping execute_grasp.")
+                return
         time.sleep(0.5)
         
         print("[Grasp] Pick complete!")

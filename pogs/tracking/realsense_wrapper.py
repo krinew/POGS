@@ -18,10 +18,18 @@ class RealSense():
         self.config = rs.config()
         
         # Resolve resolution
+        # Note: D455 requires matching fps for depth and color
+        # 640x480@30fps works for both streams
+        # 1280x720 only works at 5fps for depth
         if resolution == '720p':
             w, h = 1280, 720
+            fps = min(fps, 5)  # D455 depth max at 720p
         elif resolution == '1080p':
             w, h = 1920, 1080
+            fps = 5
+        elif resolution == '480p':
+            w, h = 640, 480
+            fps = min(fps, 30)
         else:
             w, h = 640, 480 # Default fallback
             
