@@ -241,14 +241,51 @@ class Optimizer:
     
     def _cluster_interactively(self):
         _ = input("Model populated (interactively crop and press enter to continue)")
-        self.keep_inds = self.pipeline.model.keep_inds
         
-        keep_inds_mask = torch.zeros_like(self.pipeline.model.cluster_labels)
+        # Wait for cluster_labels to be populated via the UI
+        while self.pipeline.model.cluster_labels is None:
+            print("Waiting for cluster_labels to be set... Please click 'Cluster Scene' in the viser UI.")
+            time.sleep(1.0)
+        
+        # Ensure cluster_labels is 1D
+        cluster_labels_raw = self.pipeline.model.cluster_labels
+        if cluster_labels_raw.dim() > 1:
+            cluster_labels_raw = cluster_labels_raw.squeeze()
+        
+        # Handle case where keep_inds might be None (user didn't crop before clustering)
+        if self.pipeline.model.keep_inds is None:
+            # Use all points
+            num_gaussians = cluster_labels_raw.shape[0]
+            self.keep_inds = torch.arange(num_gaussians, device=cluster_labels_raw.device)
+            self.pipeline.model.keep_inds = self.keep_inds
+        else:
+            self.keep_inds = self.pipeline.model.keep_inds
+        
+        keep_inds_mask = torch.zeros_like(cluster_labels_raw)
         keep_inds_mask[self.keep_inds] = 1
         keep_inds_mask = keep_inds_mask.to(torch.bool)
         
-        cluster_labels = self.pipeline.model.cluster_labels[self.keep_inds].to(torch.int32)
-        cluster_labels_global = self.pipeline.model.cluster_labels.to(torch.int32)
+        cluster_labels = cluster_labels_raw[self.keep_inds].to(torch.int32)
+        cluster_labels_global = cluster_labels_raw.to(torch.int32)
+        
+        # Build cgtf_stack from crop_group_tf_list (same logic as _export_state in pogs_pipeline.py)
+        from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
+        cgtf = []
+        for i in range(len(self.pipeline.crop_group_tf_list)):
+            tf = np.zeros(7)
+            tf[:4] = self.pipeline.crop_group_tf_list[i].wxyz
+            tf[4:] = self.pipeline.crop_group_tf_list[i].position / VISER_NERFSTUDIO_SCALE_RATIO
+            cgtf.append(tf)
+        
+        # If no crop transforms, create identity transforms for each cluster
+        if not cgtf:
+            num_clusters = int(cluster_labels.max().item()) + 1
+            for i in range(num_clusters):
+                tf = np.zeros(7)
+                tf[0] = 1.0  # identity quaternion (w=1, x=0, y=0, z=0)
+                cgtf.append(tf)
+        
+        self.pipeline.cgtf_stack = np.stack(cgtf)
         
         self.tfs = self.pipeline.cgtf_stack # (n,7) quat-pos
         self.pipeline.model.cgtf_stack = self.pipeline.cgtf_stack

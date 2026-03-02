@@ -178,7 +178,7 @@ def plot_gripper_pro_max(center, R, width, depth, score=1, color=None):
     return gripper, colors[0]
 
 def main(
-    config_path: Path = Path("/home/pi0/POGS/outputs/my_scene/pogs/2026-01-25_230605/config.yml"),
+    config_path: Path = Path("/home/pi0/POGS/outputs/my_scene/pogs/2026-01-25_223408/config.yml"),
     dry_run: bool = False,
 ):
     """
