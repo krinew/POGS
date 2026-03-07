@@ -57,6 +57,8 @@ class OpenManipulatorLeRobot:
         input_mode: str = "radians",
         joint_range_deg: Optional[list[float]] = None,
         use_leader_ids: bool = True,
+        include_gripper: bool = True,
+        gripper_id_override: Optional[int] = None,
     ):
         if not _HAS_LEROBOT:
             raise ImportError("LeRobot OMX backend not available. Ensure BTP_OMX_Lerobot is present.")
@@ -67,7 +69,11 @@ class OpenManipulatorLeRobot:
         self.robot_id = robot_id
 
         # Choose motor IDs based on configuration
-        motor_ids = LEADER_MOTOR_IDS if use_leader_ids else FOLLOWER_MOTOR_IDS
+        motor_ids = LEADER_MOTOR_IDS.copy() if use_leader_ids else FOLLOWER_MOTOR_IDS.copy()
+        
+        # Override gripper ID if specified
+        if gripper_id_override is not None:
+            motor_ids["gripper"] = gripper_id_override
 
         # Load calibration if available
         calibration = None
@@ -95,15 +101,24 @@ class OpenManipulatorLeRobot:
                 }
 
         # Create motor bus with chosen IDs
+        motors_dict = {
+            "shoulder_pan": Motor(motor_ids["shoulder_pan"], "xm430-w350", MotorNormMode.DEGREES),
+            "shoulder_lift": Motor(motor_ids["shoulder_lift"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+            "elbow_flex": Motor(motor_ids["elbow_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+            "wrist_flex": Motor(motor_ids["wrist_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
+        }
+        if include_gripper:
+            motors_dict["gripper"] = Motor(motor_ids["gripper"], "xm430-w350", MotorNormMode.RANGE_0_100)
+        
+        self._has_gripper = include_gripper
+        
+        # Filter calibration to only include motors we have
+        if calibration is not None:
+            calibration = {k: v for k, v in calibration.items() if k in motors_dict}
+        
         self.bus = DynamixelMotorsBus(
             port=port,
-            motors={
-                "shoulder_pan": Motor(motor_ids["shoulder_pan"], "xm430-w350", MotorNormMode.DEGREES),
-                "shoulder_lift": Motor(motor_ids["shoulder_lift"], "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "elbow_flex": Motor(motor_ids["elbow_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "wrist_flex": Motor(motor_ids["wrist_flex"], "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "gripper": Motor(motor_ids["gripper"], "xm430-w350", MotorNormMode.RANGE_0_100),
-            },
+            motors=motors_dict,
             calibration=calibration,
         )
         self.bus.apply_drive_mode = False
@@ -135,10 +150,16 @@ class OpenManipulatorLeRobot:
             self.parent = parent
 
         def open(self):
-            self.parent._send_action({"gripper.pos": 100.0})
+            if self.parent._has_gripper:
+                self.parent._send_action({"gripper.pos": 100.0})
+            else:
+                print("[Gripper] No gripper connected - skipping open")
 
         def close(self):
-            self.parent._send_action({"gripper.pos": 0.0})
+            if self.parent._has_gripper:
+                self.parent._send_action({"gripper.pos": 0.0})
+            else:
+                print("[Gripper] No gripper connected - skipping close")
 
     @property
     def gripper(self):
