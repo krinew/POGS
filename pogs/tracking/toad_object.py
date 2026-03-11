@@ -105,7 +105,7 @@ class ToadObject:
         save_dir: str
     ):
         # Make sure this path is set to your contact_graspnet_env
-        contact_graspnet_env_path = os.path.join(dir_path,'../../../anaconda3/envs/contact_graspnet_env/bin/python')
+        contact_graspnet_env_path = os.path.join(os.path.expanduser('~'), 'miniconda3/envs/contact_graspnet_env/bin/python')
         generate_grasps_path = os.path.join(dir_path,'../grasping/generate_grasps_ply.py')
         print(contact_graspnet_env_path + " " + generate_grasps_path + ' --seg_np_path ' + seg_np_path + ' --full_np_path ' + full_np_path + ' --pc_bounding_box_path ' + table_bounding_box_path + ' --save_dir ' + save_dir)
         result = subprocess.run([contact_graspnet_env_path, generate_grasps_path, "--seg_np_path", seg_np_path, "--full_np_path", full_np_path, "--pc_bounding_box_path", table_bounding_box_path, "--save_dir", save_dir], capture_output=True, text=True)

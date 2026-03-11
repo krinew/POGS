@@ -41,13 +41,11 @@ def load_grasps_from_graspnet(
     try:
         from pogs.grasping.generate_grasps_ply import generate_grasps
         from pogs.contact_graspnet_wrapper.prime_config_utils import load_config
-        
         # Paths (adapt to your setup)
         seg_np_path = f"{scene_dir}/segmented_gaussians.npy"
         full_np_path = f"{scene_dir}/full_gaussians.npy"
         bbox_path = f"{scene_dir}/bbox.json"
         ckpt_dir = "path/to/graspnet/checkpoint"  # Update this
-        
         print(f"[Pipeline] Generating grasps from {scene_dir}...")
         pred_grasps, scores, contact_pts, _, _ = generate_grasps(
             seg_np_path=seg_np_path,
@@ -64,13 +62,10 @@ def load_grasps_from_graspnet(
             arg_configs={},
             save_dir=scene_dir,
         )
-        
         return pred_grasps, scores, contact_pts
-    
     except Exception as e:
         print(f"[Pipeline] Grasp generation failed: {e}")
-        print("[Pipeline] Using mock grasps for demo...")
-        return generate_mock_grasps()
+        raise RuntimeError("GraspNet failed. No mock fallback. Exiting.")
 
 
 def generate_mock_grasps(n_grasps: int = 5) -> tuple:

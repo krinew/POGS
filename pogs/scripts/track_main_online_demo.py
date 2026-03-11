@@ -193,7 +193,7 @@ def main(
     wp.init()
     
     # Create UI controls
-    opt_init_handle = server.add_gui_button("Set initial frame", disabled=True)
+    opt_init_handle = server.add_gui_button("Set initial frame", disabled=False)
     
     # Initialize CLIP model for language understanding
     clip_encoder = OpenCLIPNetworkConfig(
@@ -205,10 +205,10 @@ def main(
     assert isinstance(clip_encoder, OpenCLIPNetwork)
     
     # Add UI elements for user interaction
-    text_handle = server.add_gui_text("Positives", "", disabled=True)
-    query_handle = server.add_gui_button("Query", disabled=True)
-    generate_grasps_handle = server.add_gui_button("Generate Grasps on Query", disabled=True)
-    execute_grasp_handle = server.add_gui_button("Execute Grasp for Query", disabled=True)
+    text_handle = server.add_gui_text("Positives", "", disabled=False)
+    query_handle = server.add_gui_button("Query", disabled=False)
+    generate_grasps_handle = server.add_gui_button("Generate Grasps on Query", disabled=False)
+    execute_grasp_handle = server.add_gui_button("Execute Grasp for Query", disabled=False)
     
     # Load camera configuration from YAML
     config_filepath = os.path.join(dir_path, '../configs/camera_config.yaml')
@@ -347,16 +347,25 @@ def main(
         Callback for initializing the tracking optimization.
         Gets current frame from camera and initializes object pose.
         """
-        assert (zed is not None) and (toad_opt is not None)
-        opt_init_handle.disabled = True
-        l, _, depth = zed.get_frame(depth=True)
-        toad_opt.set_frame(l, toad_opt.cam2world_ns, depth)
-        if zed.raft_lock is not None:
-            with zed.raft_lock:
+        try:
+            assert (zed is not None) and (toad_opt is not None)
+            opt_init_handle.disabled = True
+            l, _, depth = zed.get_frame(depth=True)
+            toad_opt.set_frame(l, toad_opt.cam2world_ns, depth)
+            if zed.raft_lock is not None:
+                with zed.raft_lock:
+                    toad_opt.init_obj_pose()
+            else:
                 toad_opt.init_obj_pose()
-        else:
-            toad_opt.init_obj_pose()
-        query_handle.disabled = False
+            query_handle.disabled = False
+            print("✅ Initial frame set successfully!")
+        except RuntimeError as e:
+            print(f"⚠️ Error setting initial frame: {e}")
+            print("Try clicking 'Set initial frame' again or restart the demo.")
+            opt_init_handle.disabled = False
+        except Exception as e:
+            print(f"⚠️ Unexpected error: {e}")
+            opt_init_handle.disabled = False
         
     opt_init_handle.disabled = False
     text_handle.disabled = False
@@ -369,23 +378,36 @@ def main(
         """
         text_positives = text_handle.value
         
-        clip_encoder.set_positives(text_positives.split(";"))
-        if len(clip_encoder.positives) > 0:
-            # Calculate relevancy scores based on CLIP embeddings
-            relevancy = toad_opt.get_clip_relevancy(clip_encoder)
-            group_masks = toad_opt.optimizer.group_masks
-
-            # Find object with highest relevancy to query
-            relevancy_avg = []
-            for mask in group_masks:
-                relevancy_avg.append(torch.mean(relevancy[:,0:1][mask]))
-            relevancy_avg = torch.tensor(relevancy_avg)
-            toad_opt.max_relevancy_label = torch.argmax(relevancy_avg).item()
-            toad_opt.max_relevancy_text = text_positives
-            generate_grasps_handle.disabled = False
+        if not text_positives or text_positives.strip() == "":
+            print("⚠️ Please enter an object name in the 'Positives' text box first!")
+            return
+        
+        try:
+            # Clear CUDA cache before CLIP query to free memory
+            torch.cuda.empty_cache()
             
-        else:
-            print("No language query provided")
+            clip_encoder.set_positives(text_positives.split(";"))
+            if len(clip_encoder.positives) > 0:
+                # Calculate relevancy scores based on CLIP embeddings
+                relevancy = toad_opt.get_clip_relevancy(clip_encoder)
+                group_masks = toad_opt.optimizer.group_masks
+
+                # Find object with highest relevancy to query
+                relevancy_avg = []
+                for mask in group_masks:
+                    relevancy_avg.append(torch.mean(relevancy[:,0:1][mask]))
+                relevancy_avg = torch.tensor(relevancy_avg)
+                toad_opt.max_relevancy_label = torch.argmax(relevancy_avg).item()
+                toad_opt.max_relevancy_text = text_positives
+                generate_grasps_handle.disabled = False
+                print(f"✅ Query '{text_positives}' matched object {toad_opt.max_relevancy_label}")
+            else:
+                print("⚠️ No language query provided")
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print("⚠️ CUDA out of memory! Try restarting the demo.")
+        except Exception as e:
+            print(f"⚠️ Query error: {e}")
     
     @generate_grasps_handle.on_click
     def _(_):
@@ -394,16 +416,32 @@ def main(
         Exports object meshes and uses grasp planning to find optimal grasps.
         """
         print("Enter generate grasps")
-        # Export mesh of the queried object
-        toad_opt.state_to_ply(toad_opt.max_relevancy_label)
-        local_ply_filename = str(toad_opt.config_path.parent.joinpath("local.ply"))
-        global_ply_filename = str(toad_opt.config_path.parent.joinpath("global.ply"))
-        table_bounding_cube_filename = str(toad_opt.pipeline.datamanager.get_datapath().joinpath("table_bounding_cube.json"))
-        save_dir = str(toad_opt.config_path.parent)
-        print("Starting generate grasps")
-        # Run grasp planning algorithm
-        ToadObject.generate_grasps(local_ply_filename, global_ply_filename, table_bounding_cube_filename, save_dir)
-        print("End generate grasps")
+        
+        # Check if state_stack has data (means Query was run successfully)
+        if not hasattr(toad_opt, 'max_relevancy_label') or toad_opt.max_relevancy_label is None:
+            print("⚠️ Please run Query first to select an object!")
+            return
+        
+        if len(toad_opt.pipeline.state_stack) == 0:
+            print("⚠️ No state available. Please click 'Set initial frame' first, then run Query.")
+            return
+        
+        try:
+            # Export mesh of the queried object
+            toad_opt.state_to_ply(toad_opt.max_relevancy_label)
+            local_ply_filename = str(toad_opt.config_path.parent.joinpath("local.ply"))
+            global_ply_filename = str(toad_opt.config_path.parent.joinpath("global.ply"))
+            table_bounding_cube_filename = str(toad_opt.pipeline.datamanager.get_datapath().joinpath("table_bounding_cube.json"))
+            save_dir = str(toad_opt.config_path.parent)
+            print("Starting generate grasps")
+            # Run grasp planning algorithm
+            ToadObject.generate_grasps(local_ply_filename, global_ply_filename, table_bounding_cube_filename, save_dir)
+            print("End generate grasps")
+            execute_grasp_handle.disabled = False
+            print("✅ Grasps generated successfully! Click 'Execute Grasp for Query' to execute.")
+        except Exception as e:
+            print(f"⚠️ Error generating grasps: {e}")
+            return
         
         # Optionally visualize table bounding box for collision avoidance
         vis_table_bounding_cube = False
@@ -472,7 +510,19 @@ def main(
         Plans and executes a pre-grasp, grasp, and post-grasp trajectory.
         """
         save_dir = str(toad_opt.config_path.parent)
-        best_grasp = np.load(os.path.join(save_dir,'grasp_point_world.npy'))
+        grasp_file = os.path.join(save_dir, 'grasp_point_world.npy')
+        
+        # Check if grasp file exists
+        if not os.path.exists(grasp_file):
+            print("⚠️ No grasp file found! Please click 'Generate Grasps on Query' first.")
+            return
+        
+        try:
+            best_grasp = np.load(grasp_file)
+            print(f"✅ Loaded grasp from {grasp_file}")
+        except Exception as e:
+            print(f"⚠️ Error loading grasp: {e}")
+            return
         
         # Apply Z-axis rotation if grasp is on the negative Y side of the workspace
         if(best_grasp[0,1] < 0):
