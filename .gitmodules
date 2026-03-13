@@ -16,3 +16,9 @@
 [submodule "pogs/dependencies/nerfstudio"]
 	path = pogs/dependencies/nerfstudio
 	url = https://github.com/nerfstudio-project/nerfstudio.git
+[submodule "PointCloudMatters"]
+	path = PointCloudMatters
+	url = https://github.com/HaoyiZhu/PointCloudMatters
+[submodule "pointnet2"]
+	path = pointnet2
+	url = https://github.com/charlesq34/pointnet2
