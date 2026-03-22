@@ -28,6 +28,7 @@ import open3d as o3d
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 # Pre-calibrated transforms between coordinate frames
+
 def _load_rigid_transform(path: str, default: RigidTransform, name: str) -> RigidTransform:
     try:
         return RigidTransform.load(path)
@@ -53,6 +54,8 @@ WRIST_TO_CAM = _load_rigid_transform(
     _identity_wrist_cam,
     "WRIST_TO_CAM",
 )
+WORLD_TO_ZED2 = RigidTransform.load(dir_path+"/../calibration_outputs/world_to_extrinsic_realsense.tf")
+
 
 DEVICE = 'cuda:0'
 
@@ -278,6 +281,7 @@ def main(
             return _Pose()
 
     # Initialize robot arm
+
     if dry_run:
         print("[DRY RUN] Using dummy robot. No OpenManipulator required.")
         robot = _DummyRobot()
@@ -292,6 +296,17 @@ def main(
     robot.move_joint(home_joints, vel=1.0, acc=0.1)
     world_to_wrist = robot.get_pose()
     # world_to_wrist.from_frame = "wrist"
+
+    # robot = UR5Robot(gripper=1)
+    # clear_tcp(robot)
+    
+    # Move robot to home position
+    # home_joints = np.array([-1.433847729359762, -1.6635258833514612, -0.8512895742999476, -3.7683952490436, -1.4371045271502894, 3.1419787406921387])
+    # robot.move_joint(home_joints, vel=1.0, acc=0.1)
+    
+    # Optional: Mocking robot position for now
+    world_to_wrist = RigidTransform(from_frame="wrist", to_frame="world")
+
 
     # Get camera transformation
     camera_tf = WORLD_TO_ZED2
@@ -629,6 +644,18 @@ def main(
         time.sleep(0.5)
         
         print("[Grasp] Pick complete!")
+        # TODO: Implement OMX Grasping here when ready
+        # robot.gripper.open()  # Open gripper
+        time.sleep(1)
+        # robot.move_pose(pre_grasp_rigid_tf, vel=0.3, acc=0.1)  # Move to pre-grasp position
+        time.sleep(1)
+        final_grasp_rigid_tf = RigidTransform(rotation=best_grasp[:3,:3], translation=best_grasp[:3,3])
+        # robot.move_pose(final_grasp_rigid_tf, vel=0.3, acc=0.1)  # Move to grasp position
+        time.sleep(1)
+        # robot.gripper.close()  # Close gripper to grasp object
+        time.sleep(1)
+        # robot.move_pose(post_grasp_rigid_tf, vel=0.3, acc=0.1)  # Lift object
+        time.sleep(1)
 
     # Lists to store frames for debugging or recording
     real_frames = []

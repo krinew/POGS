@@ -27,7 +27,7 @@ python pogs/scripts/realsense_pogs_capture.py --scene_name my_scan_03 --frame_sk
 ## 3. Process Data (COLMAP)
 The official POGS workflow assumes the robot provides poses. Since we are handheld, we must calculate poses using `nerfstudio`'s processing tool (which runs COLMAP).
 
-**Note:** We use `--matching-method exhaustive` for better reconstruction results on small object scans.
+**Note:** We use `--matching-method exhaustive` for better reconstruction results on small object scans. Before runnig this keep a backup in the backup folder as ns destrys the image we are running this just to get the correct transform.json. Then after this runs copy the transform .json and replace it into the original copy taken then train on that only.
 
 ```bash
 # This generates the required transforms.json with correct poses

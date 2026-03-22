@@ -56,7 +56,15 @@ def main():
     config.enable_stream(rs.stream.color, W, H, rs.format.bgr8, args.fps)
 
     # Start streaming
-    profile = pipeline.start(config)
+    try:
+        profile = pipeline.start(config)
+    except RuntimeError:
+        print("Failed to start with 1280x720. Falling back to 640x480 (Possible USB 2.0 constraint)")
+        config = rs.config()
+        W, H = 640, 480
+        config.enable_stream(rs.stream.depth, W, H, rs.format.z16, args.fps)
+        config.enable_stream(rs.stream.color, W, H, rs.format.bgr8, args.fps)
+        profile = pipeline.start(config)
 
     # Get depth scale
     depth_sensor = profile.get_device().first_depth_sensor()
