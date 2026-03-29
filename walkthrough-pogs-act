@@ -1,0 +1,61 @@
+# PointNet++ Integration in POGS-ACT Pipeline
+
+This document walks through the completed integration of a PyTorch PointNet++ encoder into the POGS-ACT pipeline, enabling the use of POGS's Gaussian Splatting outputs to drive ACT policy learning via PointNet++.
+
+## 1. PointNet++ Encoder Module
+
+The original PointCloudMatters ACT pipeline used a sparse-convolutional [PointNet](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/models/components/pcd_encoder/pointnet.py#16-86) or `SpUNet` backbone. The `pointnet2` submodule in the repository was based on TensorFlow and was incompatible with this PyTorch pipeline.
+
+We implemented a native PyTorch PointNet++ SSG (Single Scale Grouping) encoder in [PointCloudMatters/src/models/components/pcd_encoder/pointnet2.py](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/models/components/pcd_encoder/pointnet2.py).
+- **Architecture**: 3 Set Abstraction (SA) layers for downsampling and feature extraction, followed by 3 Feature Propagation (FP) layers for upsampling back to the original point cloud resolution.
+- **Operations**: Utilizes PCM's existing custom CUDA `pointops` library for Farthest Point Sampling (FPS), Ball Query, and Distance-Weighted Interpolation.
+- **Interface Compatibility**: The module accepts the exact `input_dict` format ([coord](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/models/components/act/act.py#467-507), `feat`, [offset](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/libs/pointops/functions/utils.py#120-122), `grid_coord`) expected by `ACTPCD.forward_pcd_embed()` and returns per-point [(N, 512)](file:///d:/vs%20code%20files/POGS-ACT/POGS/pogs/pogs_pipeline.py#520-527) features.
+- **Pretrained Weights**: It supports loading weights from the `yanx27/Pointnet_Pointnet2_pytorch` ModelNet40 checkpoint via the `pretrained_path` config argument.
+
+```python
+# Usage via Hydra config (see configs/exp_rlbench_act_policy/rlbench_model/pretrained_pointnet2_pcd.yaml)
+backbone:
+  _target_: src.models.components.pcd_encoder.pointnet2.PointNet2
+  in_channels: 70  # 6 for xyz+rgb, 64 for DINO
+  num_classes: 0
+  pretrained_path: checkpoints/pointnet2_ssg_modelnet40.pth
+```
+
+## 2. POGS to PCM Point Cloud Bridge
+
+The POGS pipeline natively optimizes Gaussians (means, SH colors, opacities, scales, quaternions, and DINO features). We built [pogs_to_pointcloud.py](file:///d:/vs%20code%20files/POGS-ACT/POGS/pogs/pogs_to_pointcloud.py) to bridge this output precisely into the format PCM's ACT models expect.
+
+The bridging process matches exactly how POGS exports its visible Gaussians to Open3D point clouds:
+1. **Filtering**: Gaussian points are filtered based on an opacity threshold (removing fuzz) and optional cluster isolation (e.g. grasping a specific object).
+2. **Color Conversion**: `features_dc` is converted to RGB via [SH2RGB](file:///d:/vs%20code%20files/POGS-ACT/POGS/pogs/pogs_to_pointcloud.py#9-11) if spherical harmonics are enabled, or via sigmoid if not.
+3. **ACT Normalization**: Colors are scaled exactly to the `[-1, 1]` range expected by PCM's [NormalizeColorPCD](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/data/components/transformpcd.py#83-88) augmentation.
+4. **DINO Integration**: The 64-dim DINO features are aggregated alongside the base 6-dim (xyz+rgb) features, creating a rich **70-channel input** perfectly sized for the new PointNet++ encoder.
+5. **Voxelization**: The outputs are voxelized to compute `grid_coord` required for PCM's batching mechanisms.
+
+## 3. Embedding Quality Evaluation
+
+To ensure the new PointNet++ encoder is producing meaningful and geometrically-sound representations, we built a comprehensive standalone evaluation script: [evaluate_embeddings.py](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/evaluate_embeddings.py).
+
+This script runs the following tests:
+*   **Decoder Reconstruction**: Using a custom FoldingNet-style [PointCloudDecoder](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/models/components/pcd_encoder/decoder.py#6-91) (in [decoder.py](file:///d:/vs%20code%20files/POGS-ACT/POGS/PointCloudMatters/src/models/components/pcd_encoder/decoder.py)), it attempts to unfold the global 1024-dim embedding back into the original 3D point cloud, measuring success via **Chamfer Distance**.
+*   **Linear Probing**: Freezes the PointNet++ backbone and trains a single linear layer to classify objects, validating the linear separability of the embeddings.
+*   **t-SNE Visualization**: Generates a 2D projection plot (`outputs/tsne_embeddings.png`) of the global embeddings to visually verify cluster separation between different semantic classes.
+
+**To run the evaluation:**
+```bash
+python PointCloudMatters/src/evaluate_embeddings.py --in_channels 70 --ckpt <path_to_weights>
+```
+
+## 4. Running End-to-End Simulation Tests
+
+The integration is architected entirely through Hydra configurations, meaning the standard ACT RLBench/ManiSkill2 evaluation scripts work out of the box with zero modifications to the core training loop.
+
+**To test the PointNet++ policy in simulation:**
+```bash
+cd PointCloudMatters
+python src/test_rlbench_act.py \
+    exp_rlbench_act_policy=rlbench_model/scratch_pointnet2_pcd \
+    rlbench_task=pick_and_lift \
+    ckpt_path=path/to/your/checkpoint.ckpt
+```
+*Note: This requires a machine with CoppeliaSim/RLBench or ManiSkill2 installed.*
