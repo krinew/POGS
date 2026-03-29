@@ -954,9 +954,22 @@ class POGSModel(SplatfactoModel):
 
         for i, scale in enumerate(scales_list):
             with torch.no_grad():
-                out = self.gaussian_field.get_outputs_from_feature(field_output.view(H*W, -1), scale * torch.ones(H*W, 1, device=self.device))
-                instances_output_im = out[GaussianFieldHeadNames.INSTANCE].to(dtype=torch.float32).view(H, W, -1)
-                clip_output_im = out[GaussianFieldHeadNames.CLIP].to(dtype=torch.float32).view(H, W, -1)
+                H_W = H * W
+                chunk_size = 100000  # Process in 100k pixel batches to prevent CUDA OOM
+                outs_instance = []
+                outs_clip = []
+                
+                feat_flat = field_output.view(H_W, -1)
+                scale_flat = scale * torch.ones(H_W, 1, device=self.device)
+                
+                for start in range(0, H_W, chunk_size):
+                    end = min(start + chunk_size, H_W)
+                    out_chunk = self.gaussian_field.get_outputs_from_feature(feat_flat[start:end], scale_flat[start:end])
+                    outs_instance.append(out_chunk[GaussianFieldHeadNames.INSTANCE].to(dtype=torch.float32))
+                    outs_clip.append(out_chunk[GaussianFieldHeadNames.CLIP].to(dtype=torch.float32))
+                
+                instances_output_im = torch.cat(outs_instance, dim=0).view(H, W, -1)
+                clip_output_im = torch.cat(outs_clip, dim=0).view(H, W, -1)
 
             for j in range(n_phrases):
                 if preset_scales is None or j == i:

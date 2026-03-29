@@ -478,12 +478,22 @@ class Optimizer:
         hash_encoding = hash_encoding.sum(dim=1)
         
         for i, scale in enumerate(scales_list):
-            clip_feats = self.optimizer.pogs_model.gaussian_field.get_clip_outputs_from_feature(hash_encoding, 
-                scale.to(self.optimizer.pogs_model.device) *  
-                torch.ones(self.optimizer.pogs_model.num_points, 1, device=self.optimizer.pogs_model.device)) # (N, 96) -> (N, 512)
+            N_points = self.optimizer.pogs_model.num_points
+            chunk_size = 100000
+            outs_clip = []
+            scale_t = scale.to(self.optimizer.pogs_model.device) * torch.ones(N_points, 1, device=self.optimizer.pogs_model.device)
+            
+            for start in range(0, N_points, chunk_size):
+                end = min(start + chunk_size, N_points)
+                clip_chunk = self.optimizer.pogs_model.gaussian_field.get_clip_outputs_from_feature(
+                    hash_encoding[start:end], scale_t[start:end]
+                )
+                outs_clip.append(clip_chunk)
+            
+            clip_feats = torch.cat(outs_clip, dim=0)
 
             for j in range(n_phrases):
-                probs = clip_encoder.get_relevancy(clip_feats / (clip_feats.norm(dim=-1, keepdim=True)+1e-6), 0).view(self.optimizer.pogs_model.num_points, -1)
+                probs = clip_encoder.get_relevancy(clip_feats / (clip_feats.norm(dim=-1, keepdim=True)+1e-6), 0).view(N_points, -1)
                 
                 pos_prob = probs[..., 0:1]
                 all_probs.append((pos_prob.max(), scale))
