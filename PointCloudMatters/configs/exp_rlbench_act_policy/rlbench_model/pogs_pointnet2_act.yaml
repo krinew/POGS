@@ -1,0 +1,54 @@
+# @package _global_
+defaults:
+  - override /data: pogs_act_pcd_dataset
+  - override /model: rlbench_act_pcd_model
+
+task_name: pogs_pointnet2_act
+
+data:
+  batch_size_train: 8
+
+trainer:
+  accumulate_grad_batches: 4
+
+model:
+  policy:
+    _target_: src.models.components.act.pointnet2_act.ACTRLBenchPointNet2
+    backbone: null
+    obs_embed_dim: 1024
+    transformer:
+      _target_: src.models.components.act.transformer.Transformer
+      d_model: 512
+      dropout: 0.1
+      nhead: 8
+      dim_feedforward: 32
+      num_encoder_layers: 4
+      num_decoder_layers: 7
+      normalize_before: false
+      return_intermediate_dec: true
+    encoder:
+      _target_: src.models.components.act.transformer.TransformerEncoder
+      d_model: 512
+      dropout: 0.1
+      nhead: 8
+      dim_feedforward: 32
+      num_layers: 4
+      normalize_before: false
+      activation: relu
+    hidden_dim: 512
+    num_queries: 100
+    num_cameras: 0
+    action_dim: 11
+    qpos_dim: 11
+    env_state_dim: 0
+    latent_dim: 32
+    action_loss:
+      _target_: torch.nn.MSELoss
+      reduction: none
+    klloss:
+      _target_: src.models.components.loss.misc.KLDivergence
+    kl_weight: 10.0
+    goal_cond_dim: 0
+    rot_type: 6d
+    collision: true
+    position_loss_weight: 10.0

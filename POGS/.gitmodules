@@ -1,0 +1,18 @@
+[submodule "pogs/dependencies/detectron2"]
+	path = pogs/dependencies/detectron2
+	url = https://github.com/facebookresearch/detectron2.git
+[submodule "pogs/dependencies/Detic"]
+	path = pogs/dependencies/Detic
+	url = https://github.com/facebookresearch/Detic.git
+[submodule "pogs/dependencies/ur5py"]
+	path = pogs/dependencies/ur5py
+	url = https://github.com/kushtimusPrime/ur5py
+[submodule "pogs/dependencies/raftstereo"]
+	path = pogs/dependencies/raftstereo
+	url = https://github.com/kushtimusPrime/RAFT-Stereo
+[submodule "pogs/dependencies/contact_graspnet"]
+	path = pogs/dependencies/contact_graspnet
+	url = https://github.com/NVlabs/contact_graspnet.git
+[submodule "pogs/dependencies/nerfstudio"]
+	path = pogs/dependencies/nerfstudio
+	url = https://github.com/nerfstudio-project/nerfstudio.git

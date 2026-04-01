@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - override /data: rlbench_act_pcd_dataset
+  - override /model: rlbench_act_pcd_model
+
+task_name: pretrained_pointnet2_pcd
+
+data:
+  batch_size_train: 8
+
+trainer:
+  accumulate_grad_batches: 4
+
+model:
+  policy:
+    _target_: src.models.components.act.pointnet2_act.ACTRLBenchPointNet2
+    backbone:
+      _target_: src.models.components.pcd_encoder.pointnet2_encoder.PointNet2Encoder
+      in_channels: 6
+      # Path to pretrained PointNet++ part-segmentation checkpoint
+      # (relative to PointCloudMatters project root)
+      pretrained_path: ../Pointnet_Pointnet2_pytorch/log/part_seg/pointnet2_part_seg_msg/checkpoints/best_model.pth
+      freeze: false
