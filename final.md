@@ -46,6 +46,8 @@ rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/*.info
 # Delete the cached CLIP directory
 rm -rf /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/clip_*
 
+rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/detic.npy
+
 #### Restart the training! It will now extract features for all 600 frames.
 ns-train pogs --data data/pogs_scenes/open_drawer/shared
 

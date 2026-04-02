@@ -214,7 +214,7 @@ def main() -> None:
     args = parser.parse_args()
 
     from rlbench.action_modes.action_mode import MoveArmThenGripper
-    from rlbench.action_modes.arm_action_modes import JointVelocity
+    from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
     from rlbench.action_modes.gripper_action_modes import Discrete
     from rlbench.environment import Environment
     from rlbench.observation_config import ObservationConfig
@@ -238,7 +238,7 @@ def main() -> None:
 
     env = Environment(
         action_mode=MoveArmThenGripper(
-            arm_action_mode=JointVelocity(),
+            arm_action_mode=EndEffectorPoseViaPlanning(collision_checking=False),
             gripper_action_mode=Discrete(),
         ),
         dataset_root=str(raw_root),
@@ -263,7 +263,9 @@ def main() -> None:
         from_episode_number=first_ep,
     )[0]
     task.set_variation(variation_id)
-    _, first_obs = task.reset_to_demo(first_demo)
+    
+    # Just read the first observation directly from the loaded demo sequence
+    first_obs = first_demo._observations[0]
 
     K = np.asarray(first_obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
     extrinsics = np.asarray(first_obs.misc[f"{args.camera}_camera_extrinsics"], dtype=np.float32)
@@ -302,7 +304,9 @@ def main() -> None:
             from_episode_number=episode_id,
         )[0]
         task.set_variation(variation_id)
-        task.reset_to_demo(demo)
+        
+        # No need to hit the PyRep simulator for offline processing.
+        # We can just pass the populated Demo object directly.
 
         out_path = out_dir / f"episode{episode_id}.pkl"
         process_episode(
