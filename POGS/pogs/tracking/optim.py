@@ -128,12 +128,12 @@ class Optimizer:
 
         cam2world_ns = Cameras(
             camera_to_worlds=init_cam_ns,
-            fx=K[0, 0],
-            fy=K[1, 1],
-            cx=K[0, 2],
-            cy=K[1, 2],
-            width=width,
-            height=height,
+            fx=float(K[0, 0]),
+            fy=float(K[1, 1]),
+            cx=float(K[0, 2]),
+            cy=float(K[1, 2]),
+            width=int(width),
+            height=int(height),
         )
         self.cam2world_ns = deepcopy(cam2world_ns)
 
@@ -284,7 +284,18 @@ class Optimizer:
                 print("Clustered interactively")
 
         self.pipeline.model.mapping, cluster_labels_keep = torch.unique(cluster_labels, return_inverse=True)
-        group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(cluster_labels_keep.max().item() + 1)]
+        # BUG FIX: If user combined multiple clusters into one transform crop in the UI
+        if hasattr(self.pipeline.model, "cgtf_stack") and self.pipeline.model.cgtf_stack is not None:
+            num_transforms = len(self.pipeline.model.cgtf_stack)
+            if num_transforms == 1:
+                # Force everything into 1 single rigid group mask, and 0 label
+                cluster_labels_keep = torch.zeros_like(cluster_labels_keep)
+                group_masks = [torch.ones(len(cluster_labels_keep), dtype=torch.bool, device="cuda")]
+            else:
+                # If multiple transforms exist, assume they map cleanly to the sequential labels
+                group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(num_transforms)]
+        else:
+            group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(cluster_labels_keep.max().item() + 1)]
         
         group_masks_global = [((cid == cluster_labels_global) & keep_inds_mask).cuda() for cid in self.pipeline.model.mapping]
         self.pipeline.model.render_features = self.render_features

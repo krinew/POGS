@@ -842,13 +842,8 @@ class POGSModel(SplatfactoModel):
             0.0001, min_bound, max_bound
         )
         if len(ids) > 1e6:
-            print(f"Too many points ({len(ids)}) to cluster... aborting.")
-            print( "Consider using interactive select to reduce points before clustering.")
-            print( "Are you sure you want to cluster? Press y to continue, else return.")
-            # wait for input to continue, if yes then continue, else return
-            if input() != "y":
-                self.cluster_scene.set_disabled(False)
-                return
+            print(f"Warning: Too many points ({len(ids)} > 1,000,000). Clustering might take a minute.")
+            pass
 
         id_vec = np.array([points[0] for points in ids])  # indices of gaussians kept after downsampling
         group_feats_downsampled = group_feats[id_vec]
@@ -859,8 +854,8 @@ class POGSModel(SplatfactoModel):
         # Run cuml-based HDBSCAN
         clusterer = HDBSCAN(
             cluster_selection_epsilon=eps,
-            min_samples=50,
-            min_cluster_size=300,
+            min_samples=30,
+            min_cluster_size=70,
             allow_single_cluster=False,
         ).fit(group_feats_downsampled)
 

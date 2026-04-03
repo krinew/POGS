@@ -199,6 +199,8 @@ class POGSPipeline(VanillaPipeline):
         self.crop_group_list = []
         self.crop_group_tf_list = []
         self.model_keep_inds = None
+        self.crop_transform_handle = None
+        self.cgtf_stack = []
 
         self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
 
@@ -277,7 +279,10 @@ class POGSPipeline(VanillaPipeline):
     def _queue_state(self):
         """Save current state to stack"""
         import copy
-        self.state_stack.append(copy.deepcopy({k:v.detach() for k,v in self.model.gauss_params.items()}))
+        state = {k:v.detach() for k,v in self.model.gauss_params.items()}
+        if self.model.cluster_labels is not None:
+            state['cluster_labels'] = self.model.cluster_labels.detach().clone()
+        self.state_stack.append(copy.deepcopy(state))
         self.reset_state.set_disabled(False)
 
 
@@ -291,6 +296,10 @@ class POGSPipeline(VanillaPipeline):
             prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name]
+        if 'cluster_labels' in prev_state:
+            self.model.cluster_labels = prev_state['cluster_labels']
+        elif self.model.cluster_labels is not None:
+            self.model.cluster_labels = None
 
         self.click_location = None
         if self.click_handle is not None:
@@ -317,6 +326,19 @@ class POGSPipeline(VanillaPipeline):
         self.add_crop_to_group_list.set_disabled(True)
         self.view_crop_group_list.set_disabled(True)
     
+    def _auto_save_clusters_bg(self):
+        """Silently sync and save the current crop group out to clusters.npy without altering viewer."""
+        if len(self.crop_group_list) == 0 or len(self.state_stack) == 0:
+            return
+        keep_inds = []
+        for inds in self.crop_group_list:
+            keep_inds.extend(inds)
+        self.model.keep_inds = torch.stack(keep_inds)
+        if 'cluster_labels' in self.state_stack[0]: # ALways grab the original FULL state 
+            self.model.cluster_labels = self.state_stack[0]['cluster_labels']
+        self._export_clusters(None)
+        print(f"Auto-saved clusters.npy to disk internally with {len(self.crop_group_list)} tracked object(s). (Saving full labels of size {len(self.model.cluster_labels)} against crop size {len(self.model.keep_inds)})")
+
     def _add_crop_to_group_list(self, button: ViewerButton):
         """Add the current crop to the group list"""
         self.crop_group_list.append(self.crop_group[0])
@@ -324,12 +346,17 @@ class POGSPipeline(VanillaPipeline):
         self.crop_transform_handle.remove()
         self._reset_state(None, pop=False)
         self.view_crop_group_list.set_disabled(False)
+        self._auto_save_clusters_bg()
     
     def _add_crop_to_previous_group(self, button: ViewerButton):
         """Combine the current crop with the previous group"""
+        if len(self.crop_group_list) == 0:
+            print("Error: No previous group exists! Click 'Add Crop to Group List' instead.")
+            return
         self.crop_group_list[-1] = torch.cat([self.crop_group_list[-1], self.crop_group[0]])
         self._reset_state(None, pop=False)
         self.view_crop_group_list.set_disabled(False)
+        self._auto_save_clusters_bg()
 
     def _view_crop_group_list(self, button: ViewerButton):
         if len(self.crop_group_list) == 0:
@@ -344,9 +371,11 @@ class POGSPipeline(VanillaPipeline):
         prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name][keep_inds]
+        if 'cluster_labels' in prev_state:
+            self.model.cluster_labels = prev_state['cluster_labels'][keep_inds]
         self.model.keep_inds = keep_inds
         self._export_clusters(None)
-        self.z_export_options_cluster_labels.visible = True
+        self.z_export_options_cluster_labels.set_hidden(False)
 
     def _crop_to_click(self, button: ViewerButton):
         """Crop to click location"""
@@ -427,6 +456,12 @@ class POGSPipeline(VanillaPipeline):
             cluster_inds = clusters[np.isin(keeps, sphere_inds)]
             cluster_inds = cluster_inds[cluster_inds != -1]
 
+            if len(cluster_inds) == 0:
+                print("No clusters formed around the click point, aborting")
+                self.click_gaussian.set_disabled(False)
+                self.crop_to_click.set_disabled(False)
+                return
+
             cluster_ind = cluster_inds[0]
 
             keeps = keeps[np.where(clusters == cluster_ind)]
@@ -458,11 +493,15 @@ class POGSPipeline(VanillaPipeline):
             
         
         table_bounding_cube_filename = self.datamanager.get_datapath().joinpath("table_bounding_cube.json")
-        with open(table_bounding_cube_filename, 'r') as json_file: 
-            bounding_box_dict = json.load(json_file)
-        table_z_val = bounding_box_dict['table_height'] + 0.015 #- 0.01 # Removes everything below this value to represent the table and anything below. Found 0.008 to be good value for this
-        # table_z_val = -0.165 # z value of the table to filter out of our clusters
-        keep_list = [keep_list[0][torch.where(curr_means[keep_list[0]][:,2] > table_z_val)[0].cpu()]] # filter out table points
+        try:
+            with open(table_bounding_cube_filename, 'r') as json_file: 
+                bounding_box_dict = json.load(json_file)
+            table_z_val = bounding_box_dict['table_height'] + 0.015 #- 0.01 # Removes everything below this value to represent the table and anything below. Found 0.008 to be good value for this
+            # table_z_val = -0.165 # z value of the table to filter out of our clusters
+            keep_list = [keep_list[0][torch.where(curr_means[keep_list[0]][:,2] > table_z_val)[0].cpu()]] # filter out table points
+        except FileNotFoundError:
+            print(f"Warning: {table_bounding_cube_filename} not found. Skipping table height filtering.")
+        
         # Remove the click handle + visualization
         self.click_location = None
         self.click_handle.remove()
@@ -479,6 +518,8 @@ class POGSPipeline(VanillaPipeline):
         prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name][keep_inds]
+        if self.model.cluster_labels is not None:
+            self.model.cluster_labels = prev_state['cluster_labels'][keep_inds]
 
         """Add a transform control to the current scene, and update the model accordingly."""
 
@@ -570,9 +611,16 @@ class POGSPipeline(VanillaPipeline):
         coords = K @ newdir
         coords = coords / coords[2]
         pix_x, pix_y = int(coords[0]), int(coords[1])
+        
         self.model.eval()
         outputs = self.model.get_outputs(cam.to(self.device))
         self.model.train()
+        
+        # Clamp out-of-bounds clicks due to web UI resolution scaling
+        max_y, max_x = outputs["depth"].shape[:2]
+        pix_y = max(0, min(pix_y, max_y - 1))
+        pix_x = max(0, min(pix_x, max_x - 1))
+        
         with torch.no_grad():
             depth = outputs["depth"][pix_y, pix_x].cpu().numpy()
 
@@ -638,6 +686,8 @@ class POGSPipeline(VanillaPipeline):
         prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name][keep_inds]
+        if 'cluster_labels' in prev_state:
+            self.model.cluster_labels = prev_state['cluster_labels'][keep_inds]
         self.model.keep_inds = keep_inds
         
         

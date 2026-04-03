@@ -147,3 +147,85 @@ If you find POGS useful for your work please consider citing:
   year      = {2025},
 }
 ```
+
+## End-to-End POGS-ACT Offline Dataset Workflow (Including CoppeliaSim Data Capture)
+
+Here is the exact step-by-step workflow required to capture the scene, clear corrupted caches, train the Gaussian Splat, label the masks in the UI, extract pointclouds, and generate the final `[1024]` PointNet++ embeddings for ACT policy training.
+
+### 1. Scene Capture
+Capture RLBench offline trajectories from CoppeliaSim for POGS. Make sure to expose the simulator root and Python paths avoiding library conflicts.
+```bash
+conda activate pogs_env
+
+export COPPELIASIM_ROOT=/home/pi0/CoppeliaSim
+export LD_LIBRARY_PATH=$COPPELIASIM_ROOT:$LD_LIBRARY_PATH
+export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT
+export PYTHONPATH=$PYTHONPATH:/home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters
+
+cd /home/pi0/POGS-ACT-implementation/POGS/POGS
+python pogs/scripts/capture_rlbench_scene.py \
+    --task        open_drawer \
+    --episode     0 \
+    --data-root   /home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters/data/rlbench/raw/train \
+    --out-dir     data/pogs_scenes/open_drawer/shared \
+    --n-views     100
+```
+
+### 2. Clear Caches & Train POGS
+Before training, nuke polluted library paths and any outdated DINO/CLIP caches so `ns-train` gracefully extracts features for all frames.
+```bash
+conda activate pogs_env
+
+# 1. Completely nuke the polluted library paths that might cause a crash
+unset LD_LIBRARY_PATH
+unset LIBRARY_PATH
+
+# 2. Re-add ONLY the pure POGS environment libraries
+export POGS_ENV_ROOT="/home/pi0/miniconda3/envs/pogs_env"
+export LD_LIBRARY_PATH="$POGS_ENV_ROOT/lib"
+
+# 3. If you get out-of-dimension errors due to old cache, delete them:
+rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/dino.*
+rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/*.npy
+rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/*.info
+rm -rf /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/clip_*
+rm -f /home/pi0/POGS-ACT-implementation/POGS/POGS/outputs/shared/detic.npy
+
+# 4. Train the scene!
+cd /home/pi0/POGS-ACT-implementation/POGS/POGS
+ns-train pogs --data data/pogs_scenes/open_drawer/shared
+```
+
+### 3. Extract the Point Cloud (Optional Sanity Check)
+Extract the geometric baseline out into `.ply` meshes if desired:
+```bash
+mkdir -p data/pogs_act/open_drawer
+python pogs/scripts/export_pogs_pointcloud.py \
+    --checkpoint outputs/shared/pogs/try/nerfstudio_models/step-000003000.ckpt \
+    --out data/pogs_act/open_drawer/shared.ply \
+    --max-points 8192
+```
+
+### 4. Segment and Save the Gaussian Cluster Masks
+Open Viser UI and cluster your objects for downstream PointNet processing.
+```bash
+python scripts/run_pogs_ui.py --load-config outputs/shared/pogs/2026-04-03_010833/config.yml
+```
+**UI Actions Required:**
+1. Hit **Cluster Scene** (Wait 10-20 seconds).
+2. Hit **Toggle RGB/Cluster** to verify object isolation.
+3. Hit **Click**, then click on your target object in the scene.
+4. Hit **Crop to Click** to isolate.
+5. Hit **Add Crop to Group List**.
+6. Hit **Export Group** (saves your `outputs/shared/clusters.npy` to disk).
+
+### 5. Generate ACT Dataset (Extracting PointNet++ Embeddings Online)
+Run the dataset generation script. It processes the observations, uses your exported `clusters.npy`, and runs your DINO/Detic/RGB/XYZ frames straight through PointNet++ into a 1024-dim ACT payload.
+```bash
+python pogs/scripts/generate_pogs_act_dataset.py \
+  --task open_drawer \
+  --raw-root /home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters/data/rlbench/raw/train \
+  --pogs-config outputs/shared/pogs/2026-04-03_010833/config.yml \
+  --out-dir exports/act_datasets/ \
+  --pointnet2-ckpt /home/pi0/POGS-ACT-implementation/POGS/Pointnet_Pointnet2_pytorch/log/sem_seg/pointnet2_sem_seg/checkpoints/best_model.pth
+```

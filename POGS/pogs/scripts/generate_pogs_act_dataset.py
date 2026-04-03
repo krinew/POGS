@@ -11,6 +11,9 @@ Output format per episode:
 {
     "tracked_coords": (T, N, 3),
     "tracked_colors": (T, N, 3),
+    "tracked_dino": (T, N, 64),
+    "tracked_detic": (T, N, 64),
+    "tracked_clusters": (T, N, 1),
     "joint_positions": (T, 7),
     "gripper_open": (T, 1),
     "action": (T, 9),
@@ -49,36 +52,95 @@ def task_file_to_task_class(task_file: str):
     return getattr(mod, class_name)
 
 
-def sample_to_fixed_size(
+def sample_to_fixed_size_semantics(
     coords: np.ndarray,
     colors: np.ndarray,
+    dino: np.ndarray,
+    detic: np.ndarray,
+    clusters: np.ndarray,
     num_points: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Sample points to a fixed size so episodes can be stacked safely."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Sample points with semantic features to a fixed size using farthest point sampling (FPS)."""
     if coords.shape[0] == 0:
         raise RuntimeError("Tracked point cloud is empty.")
 
+    # Inherit FPS logic from Pointnet_Pointnet2_pytorch models
+    import sys
+    import os
+    import torch
+    _PN2_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, "../../../Pointnet_Pointnet2_pytorch/models"))
+    if _PN2_ROOT not in sys.path:
+        sys.path.insert(0, _PN2_ROOT)
+    from pointnet2_utils import farthest_point_sample
+
     if coords.shape[0] >= num_points:
-        idx = np.random.choice(coords.shape[0], num_points, replace=False)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        coords_t = torch.from_numpy(coords).unsqueeze(0).to(device)  # [1, N, 3]
+        with torch.no_grad():
+            idx_t = farthest_point_sample(coords_t, num_points)
+        idx = idx_t.squeeze(0).cpu().numpy()
     else:
         idx = np.random.choice(coords.shape[0], num_points, replace=True)
 
-    return coords[idx].astype(np.float32), colors[idx].astype(np.float32)
+    return (
+        coords[idx].astype(np.float32),
+        colors[idx].astype(np.float32),
+        dino[idx].astype(np.float32),
+        detic[idx].astype(np.float32),
+        clusters[idx].astype(np.float32)
+    )
 
 
 def extract_full_scene_pointcloud(
     optimizer: Optimizer,
     max_points: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Export full-scene tracked Gaussians and load them as point clouds."""
-    optimizer.state_to_ply(obj_id=None)
-    global_ply_path = optimizer.config_path.parent.joinpath("global.ply")
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract full-scene tracked Gaussians directly from memory along with semantic features."""
+    with torch.no_grad():
+        prev_state = optimizer.pipeline.state_stack[-1]
+        
+        means = prev_state["means"].detach().cpu().float()
+        features_dc = prev_state["features_dc"].detach().cpu().float()
+        opacities = prev_state["opacities"].detach().cpu().float()
+        
+        # semantics extraction from POGS gaussians
+        dino_feats = prev_state.get("dino_feats")
+        if dino_feats is not None:
+            dino_feats = dino_feats.detach().cpu().float()
+            
+        detic_feats = prev_state.get("detic_feats")
+        if detic_feats is not None:
+            detic_feats = detic_feats.detach().cpu().float()
+            
+        cluster_labels = None
+        if hasattr(optimizer.pipeline.model, "cluster_labels") and optimizer.pipeline.model.cluster_labels is not None:
+            cluster_labels = optimizer.pipeline.model.cluster_labels.detach().cpu().float().unsqueeze(-1)
+        else:
+            cluster_labels = torch.zeros((means.shape[0], 1), dtype=torch.float32)
 
-    pcd = o3d.io.read_point_cloud(str(global_ply_path))
-    coords = np.asarray(pcd.points, dtype=np.float32)
-    colors = np.asarray(pcd.colors, dtype=np.float32)
+        # Opacity filter mechanism
+        opacity_vals = torch.sigmoid(opacities).squeeze(-1)
+        keep = opacity_vals > 0.05
+        if keep.any():
+            means = means[keep]
+            features_dc = features_dc[keep]
+            if dino_feats is not None:
+                dino_feats = dino_feats[keep]
+            if detic_feats is not None:
+                detic_feats = detic_feats[keep]
+            cluster_labels = cluster_labels[keep]
 
-    return sample_to_fixed_size(coords, colors, max_points)
+        # Convert SH -> RGB
+        C0 = 0.28209479177387814
+        colors = torch.clamp(features_dc * C0 + 0.5, 0.0, 1.0)
+        
+        coords_np = means.numpy()
+        colors_np = colors.numpy()
+        dino_np = dino_feats.numpy() if dino_feats is not None else np.zeros((coords_np.shape[0], 64), dtype=np.float32)
+        detic_np = detic_feats.numpy() if detic_feats is not None else np.zeros((coords_np.shape[0], 64), dtype=np.float32)
+        cluster_np = cluster_labels.numpy()
+
+    return sample_to_fixed_size_semantics(coords_np, colors_np, dino_np, detic_np, cluster_np, max_points)
 
 
 def build_action_from_obs(obs) -> np.ndarray:
@@ -108,9 +170,15 @@ def get_episode_ids(episodes_root: Path) -> list[int]:
     return episode_ids
 
 
-def obs_to_tensors(obs, camera: str, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+def obs_to_tensors(obs, camera: str, device: str, match_size: tuple[int, int] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    import cv2
     rgb = getattr(obs, f"{camera}_rgb").astype(np.float32)
     depth = getattr(obs, f"{camera}_depth").astype(np.float32)
+    
+    if match_size is not None and (rgb.shape[1] != match_size[0] or rgb.shape[0] != match_size[1]):
+        rgb = cv2.resize(rgb, match_size, interpolation=cv2.INTER_LINEAR)
+        depth = cv2.resize(depth, match_size, interpolation=cv2.INTER_NEAREST)
+        
     return (
         torch.from_numpy(rgb).to(device),
         torch.from_numpy(depth).to(device),
@@ -121,6 +189,9 @@ def save_episode(
     out_path: Path,
     tracked_coords: list[np.ndarray],
     tracked_colors: list[np.ndarray],
+    tracked_dino: list[np.ndarray],
+    tracked_detic: list[np.ndarray],
+    tracked_clusters: list[np.ndarray],
     joint_positions: list[np.ndarray],
     gripper_open: list[np.ndarray],
     actions: list[np.ndarray],
@@ -129,6 +200,9 @@ def save_episode(
     payload = {
         "tracked_coords": np.stack(tracked_coords, axis=0).astype(np.float32),
         "tracked_colors": np.stack(tracked_colors, axis=0).astype(np.float32),
+        "tracked_dino": np.stack(tracked_dino, axis=0).astype(np.float32),
+        "tracked_detic": np.stack(tracked_detic, axis=0).astype(np.float32),
+        "tracked_clusters": np.stack(tracked_clusters, axis=0).astype(np.float32),
         "joint_positions": np.stack(joint_positions, axis=0).astype(np.float32),
         "gripper_open": np.stack(gripper_open, axis=0).astype(np.float32),
         "action": np.stack(actions, axis=0).astype(np.float32),
@@ -150,6 +224,7 @@ def process_episode(
     niters: int,
     device: str,
     variation_id: int,
+    encoder,
 ) -> None:
     observations = list(demo._observations)
     if len(observations) < 2:
@@ -157,23 +232,44 @@ def process_episode(
 
     optimizer.reset_optimizer()
 
-    first_rgb, first_depth = obs_to_tensors(observations[0], camera, device)
+    cam_w = int(optimizer.cam2world_ns_ds.width[0].item())
+    cam_h = int(optimizer.cam2world_ns_ds.height[0].item())
+    match_size = (cam_w, cam_h)
+
+    first_rgb, first_depth = obs_to_tensors(observations[0], camera, device, match_size)
     optimizer.set_frame(first_rgb, optimizer.cam2world_ns_ds, first_depth)
     optimizer.init_obj_pose()
 
-    tracked_coords = []
-    tracked_colors = []
+    embeds = []
     joint_positions = []
     gripper_open = []
 
     for t, obs in enumerate(observations):
-        rgb_t, depth_t = obs_to_tensors(obs, camera, device)
+        rgb_t, depth_t = obs_to_tensors(obs, camera, device, match_size)
         optimizer.set_observation(rgb_t, optimizer.cam2world_ns_ds, depth_t)
         optimizer.step_opt(niter=first_niters if t == 0 else niters)
 
-        coords_t, colors_t = extract_full_scene_pointcloud(optimizer, max_points)
-        tracked_coords.append(coords_t)
-        tracked_colors.append(colors_t)
+        coords_t, colors_t, dino_t, detic_t, cluster_t = extract_full_scene_pointcloud(optimizer, max_points)
+        
+        # Preprocess features according to PointCloudMatters PCM
+        # Normalize color to [-1, 1]
+        colors_t_255 = colors_t * 255.0 if colors_t.max() <= 1.0 else colors_t
+        colors_t_norm = colors_t_255 / 127.5 - 1.0
+        
+        # Stack features: [color, coords, dino, detic, cluster]
+        features_t = np.concatenate([colors_t_norm, coords_t, dino_t, detic_t, cluster_t], axis=-1)
+        
+        input_dict = {
+            "coord": torch.from_numpy(coords_t).to(device),
+            "feat": torch.from_numpy(features_t).to(device),
+            "offset": torch.tensor([coords_t.shape[0]], dtype=torch.int32, device=device)
+        }
+        
+        with torch.no_grad():
+            feat_out = encoder(input_dict)  # (max_points, 1024)
+            # Take the global feature which is intrinsically identically repeated for all N points
+            global_embed = feat_out[0].detach().cpu().numpy().astype(np.float32)
+            embeds.append(global_embed)
 
         joint_positions.append(np.asarray(obs.gripper_pose, dtype=np.float32))
         gripper_open.append(np.asarray([obs.gripper_open], dtype=np.float32))
@@ -183,15 +279,16 @@ def process_episode(
         next_obs = observations[t + 1] if (t + 1) < len(observations) else observations[t]
         actions.append(build_action_from_obs(next_obs))
 
-    save_episode(
-        out_path=out_path,
-        tracked_coords=tracked_coords,
-        tracked_colors=tracked_colors,
-        joint_positions=joint_positions,
-        gripper_open=gripper_open,
-        actions=actions,
-        variation_id=variation_id,
-    )
+    payload = {
+        "obs_embeds": np.stack(embeds, axis=0).astype(np.float32),
+        "joint_positions": np.stack(joint_positions, axis=0).astype(np.float32),
+        "gripper_open": np.stack(gripper_open, axis=0).astype(np.float32),
+        "action": np.stack(actions, axis=0).astype(np.float32),
+        "variation_id": int(variation_id),
+        "task_goal": np.zeros(512, dtype=np.float32),
+    }
+    with out_path.open("wb") as f:
+        pickle.dump(payload, f)
 
 
 def main() -> None:
@@ -211,7 +308,12 @@ def main() -> None:
     parser.add_argument("--start-episode", type=int, default=0)
     parser.add_argument("--max-episodes", type=int, default=-1, help="-1 means all")
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pointnet2-ckpt", type=str, required=False, default=None, help="Path to pre-trained PointNet++ checkpoint (optional)")
     args = parser.parse_args()
+
+    import sys
+    sys.path.append("/home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters")
+    from src.models.components.pcd_encoder.pointnet2_encoder import PointNet2Encoder
 
     from rlbench.action_modes.action_mode import MoveArmThenGripper
     from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
@@ -279,6 +381,14 @@ def main() -> None:
     height, width = getattr(first_obs, f"{args.camera}_rgb").shape[:2]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Instantiate encoder (135 channels = colors(3)+coords(3)+dino(128)+cluster(1))
+    encoder = PointNet2Encoder(
+        in_channels=135,
+        pretrained_path=args.pointnet2_ckpt,
+        freeze=False,
+    ).to(device)
+    encoder.eval()
+
     optimizer = Optimizer(
         Path(args.pogs_config),
         K,
@@ -309,17 +419,22 @@ def main() -> None:
         # We can just pass the populated Demo object directly.
 
         out_path = out_dir / f"episode{episode_id}.pkl"
-        process_episode(
-            optimizer=optimizer,
-            demo=demo,
-            out_path=out_path,
-            camera=args.camera,
-            max_points=args.max_points,
-            first_niters=args.first_niters,
-            niters=args.niters,
-            device=device,
-            variation_id=int(variation_id),
-        )
+        try:
+            process_episode(
+                optimizer=optimizer,
+                demo=demo,
+                out_path=out_path,
+                camera=args.camera,
+                max_points=args.max_points,
+                first_niters=args.first_niters,
+                niters=args.niters,
+                device=device,
+                variation_id=int(variation_id),
+                encoder=encoder,
+            )
+        except RuntimeError as e:
+            print(f"[Warning] Skipping episode {episode_id} due to tracking error: {e}")
+            continue
 
     env.shutdown()
     print(f"Done. Saved episodes to: {out_dir}")
