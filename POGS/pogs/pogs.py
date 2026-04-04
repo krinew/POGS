@@ -285,10 +285,16 @@ class POGSModel(SplatfactoModel):
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
         
         if obj_id is not None:
-            if invert:
-                crop_ids = torch.where(self.cluster_labels[self.keep_inds] != self.mapping[obj_id].item())[0]
+            # If the user grouped multiple clusters into a single object tracker
+            if hasattr(self, "cgtf_stack") and self.cgtf_stack is not None and len(self.cgtf_stack) == 1:
+                crop_ids = torch.arange(len(self.keep_inds), device=self.means.device)
+                if invert:
+                    crop_ids = None # Invert of everything kept is nothing, but this is an edge case
             else:
-                crop_ids = torch.where(self.cluster_labels[self.keep_inds] == self.mapping[obj_id].item())[0]
+                if invert:
+                    crop_ids = torch.where(self.cluster_labels[self.keep_inds] != self.mapping[obj_id].item())[0]
+                else:
+                    crop_ids = torch.where(self.cluster_labels[self.keep_inds] == self.mapping[obj_id].item())[0]
             
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]

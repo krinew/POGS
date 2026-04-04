@@ -186,7 +186,19 @@ def main() -> None:
     task_cls = task_file_to_task_class(args.task)
     task = env.get_task(task_cls)
 
-    act_model = RLBenchACTBCModule.load_from_checkpoint(args.act_ckpt, map_location=device)
+    import hydra
+    from omegaconf import OmegaConf
+    try:
+        OmegaConf.register_new_resolver("eval", eval)
+    except ValueError:
+        pass
+    ckpt_path = Path(args.act_ckpt)
+    run_dir = ckpt_path.parent.parent
+    cfg = OmegaConf.load(run_dir / ".hydra" / "config.yaml")
+
+    act_model = hydra.utils.instantiate(cfg.model)
+    act_state = torch.load(ckpt_path, map_location=device)["state_dict"]
+    act_model.load_state_dict(act_state)
     act_model.eval()
     act_model = act_model.to(device)
 
@@ -220,6 +232,7 @@ def main() -> None:
         from_episode_number=first_ep,
     )[0]
     task.set_variation(first_var)
+    first_demo._observations[0].misc["variation_index"] = first_var
     _, first_obs = task.reset_to_demo(first_demo)
 
     K = np.asarray(first_obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
@@ -246,6 +259,7 @@ def main() -> None:
             from_episode_number=ep_id,
         )[0]
         task.set_variation(var_num)
+        demo._observations[0].misc["variation_index"] = var_num
         _, obs = task.reset_to_demo(demo)
 
         maybe_init_optimizer_for_episode(optimizer, obs, args.camera, args.first_niters, device)

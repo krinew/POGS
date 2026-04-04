@@ -186,9 +186,18 @@ class PointNet2Encoder(nn.Module):
             for k, v in state.items()
             if k.startswith("sa1.") or k.startswith("sa2.") or k.startswith("sa3.")
         }
-
-        missing, unexpected = self.backbone.load_state_dict(backbone_state, strict=False)
-        loaded = len(backbone_state) - len(missing)
+        
+        # Filter out mismatching shapes (e.g. first layer in_channels)
+        current_state = self.backbone.state_dict()
+        filtered_state = {}
+        for k, v in backbone_state.items():
+            if k in current_state and current_state[k].shape == v.shape:
+                filtered_state[k] = v
+            else:
+                print(f"Skipping weight {k} due to shape mismatch: {v.shape} != {current_state.get(k, 'N/A')}")
+        
+        missing, unexpected = self.backbone.load_state_dict(filtered_state, strict=False)
+        loaded = len(filtered_state) - len(missing)
         print(
             f"[PointNet2Encoder] Loaded {loaded}/{len(backbone_state)} weights "
             f"from {os.path.basename(path)}.  "

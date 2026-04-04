@@ -326,18 +326,6 @@ class POGSPipeline(VanillaPipeline):
         self.add_crop_to_group_list.set_disabled(True)
         self.view_crop_group_list.set_disabled(True)
     
-    def _auto_save_clusters_bg(self):
-        """Silently sync and save the current crop group out to clusters.npy without altering viewer."""
-        if len(self.crop_group_list) == 0 or len(self.state_stack) == 0:
-            return
-        keep_inds = []
-        for inds in self.crop_group_list:
-            keep_inds.extend(inds)
-        self.model.keep_inds = torch.stack(keep_inds)
-        if 'cluster_labels' in self.state_stack[0]: # ALways grab the original FULL state 
-            self.model.cluster_labels = self.state_stack[0]['cluster_labels']
-        self._export_clusters(None)
-        print(f"Auto-saved clusters.npy to disk internally with {len(self.crop_group_list)} tracked object(s). (Saving full labels of size {len(self.model.cluster_labels)} against crop size {len(self.model.keep_inds)})")
 
     def _add_crop_to_group_list(self, button: ViewerButton):
         """Add the current crop to the group list"""
@@ -346,7 +334,7 @@ class POGSPipeline(VanillaPipeline):
         self.crop_transform_handle.remove()
         self._reset_state(None, pop=False)
         self.view_crop_group_list.set_disabled(False)
-        self._auto_save_clusters_bg()
+
     
     def _add_crop_to_previous_group(self, button: ViewerButton):
         """Combine the current crop with the previous group"""
@@ -356,7 +344,7 @@ class POGSPipeline(VanillaPipeline):
         self.crop_group_list[-1] = torch.cat([self.crop_group_list[-1], self.crop_group[0]])
         self._reset_state(None, pop=False)
         self.view_crop_group_list.set_disabled(False)
-        self._auto_save_clusters_bg()
+
 
     def _view_crop_group_list(self, button: ViewerButton):
         if len(self.crop_group_list) == 0:
@@ -374,7 +362,7 @@ class POGSPipeline(VanillaPipeline):
         if 'cluster_labels' in prev_state:
             self.model.cluster_labels = prev_state['cluster_labels'][keep_inds]
         self.model.keep_inds = keep_inds
-        self._export_clusters(None)
+
         self.z_export_options_cluster_labels.set_hidden(False)
 
     def _crop_to_click(self, button: ViewerButton):
@@ -438,7 +426,7 @@ class POGSPipeline(VanillaPipeline):
                 curr_points_ds_selected = np.zeros(len(keep_points.points), dtype=bool)
                 curr_points_ds_selected[curr_points_ds_ids] = True
 
-                _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.02, min_points=5))
+                _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.05, min_points=5))
                 nn_model = NearestNeighbors(
                     n_neighbors=1, algorithm="auto", metric="euclidean"
                 ).fit(np.asarray(curr_points_ds.points))
@@ -450,7 +438,7 @@ class POGSPipeline(VanillaPipeline):
                 clusters[~curr_points_ds_selected] = _clusters[indices[:, 0]]
 
             else:
-                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5))
+                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.05, min_points=5))
 
             # Choose the cluster that contains the click point. If there is none, move to the next scale.
             cluster_inds = clusters[np.isin(keeps, sphere_inds)]
@@ -651,8 +639,16 @@ class POGSPipeline(VanillaPipeline):
             cgtf.append(tf) # w x y z translation
             
         self.cgtf_stack = np.stack(cgtf)
-        if self.model.cluster_labels is not None and self.model.keep_inds is not None:
-            np.save(filename, np.array([self.model.cluster_labels, self.model.keep_inds, self.cgtf_stack], dtype=object))
+        
+        # ALWAYS export full cluster_labels from the original state to avoid index mismatches
+        export_labels = self.model.cluster_labels
+        if len(self.state_stack) > 0 and 'cluster_labels' in self.state_stack[0]:
+            export_labels = self.state_stack[0]['cluster_labels']
+
+        if export_labels is not None and self.model.keep_inds is not None:
+            np.save(filename, np.array([export_labels, self.model.keep_inds, self.cgtf_stack], dtype=object))
+            if button is not None:
+                print(f"Exported full cluster labels (size {len(export_labels)}) and keep_inds (size {len(self.model.keep_inds)}) to disk.")
         else:
             print("No cluster labels to export")
             

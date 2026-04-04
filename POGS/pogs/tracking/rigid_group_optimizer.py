@@ -543,9 +543,16 @@ class RigidGroupOptimizer:
         """
         with torch.no_grad():
             outputs = self.pogs_model.get_outputs(cam,tracking=True, obj_id=obj_id, BLOCK_WIDTH=8, rgb_only=True)
-            object_mask = outputs["accumulation"] > 0.9
+            object_mask = outputs["accumulation"] > 0.1
             if ~object_mask.any():
-                raise RuntimeError("Object left ROI")
+                print(f"WARNING [render_mask]: object {obj_id} accumulation > 0.1 has NO pixels.")
+                print(f"Max accumulation is: {outputs['accumulation'].max().item()}")
+                print(f"Min accumulation is: {outputs['accumulation'].min().item()}")
+                print(f"Total accumulation sum is: {outputs['accumulation'].sum().item()}")
+                # Optional: check cam position
+                print(f"Camera pose (cam.camera_to_worlds):\n{cam.camera_to_worlds}")
+                # We do not raise an error here anymore
+
             return object_mask
         
     def calculate_roi(self, obj_id: int, cam: Cameras = None):
@@ -559,6 +566,11 @@ class RigidGroupOptimizer:
                 object_mask = self.frame._obj_masks[obj_id].squeeze(0)
 
             valids = torch.where(object_mask)
+            if len(valids[0]) == 0:
+                print(f"WARNING [calculate_roi]: empty mask for obj {obj_id}, defaulting to full image (0.0 to 1.0).")
+                print(f"DEBUG: object_mask shape {object_mask.shape}, sum {object_mask.sum().item()}, min {object_mask.min().item()}, max {object_mask.max().item()}")
+                return 0.0, 1.0, 0.0, 1.0
+            
             valid_xs = valids[1]/object_mask.shape[1]
             valid_ys = valids[0]/object_mask.shape[0] # normalize to 0-1
 

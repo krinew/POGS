@@ -65,19 +65,35 @@ class Optimizer:
         init_cam_pose: torch.Tensor,  # initial camera pose in OpenCV format
     ):
         self.config_path = config_path
-
-        clusters = config_path.parent.parent.parent.joinpath("clusters.npy") # For preloading the cluster info for pre-clustered objects instead of clustering interactively
-        print("clusters file", clusters)
-        if not clusters.exists():
-            print(f"clusters.npy file does not exist. \nProceed with interactive clustering.")
-            self.cluster_from_file = None
-        else:
-            self.cluster_from_file = np.load(clusters, allow_pickle=True)
         
         # Load the POGSPipeline.
         train_config, self.pipeline, _, _ = eval_setup(config_path)
         assert isinstance(self.pipeline, POGSPipeline)
         train_config.logging.local_writer.enable = False
+
+        # For preloading the cluster info, prefer the run output root derived from
+        # config path. Fall back to outputs/<dataset_name>/clusters.npy because
+        # viewer export currently uses dataparser data name.
+        clusters_from_config = config_path.parent.parent.parent.joinpath("clusters.npy")
+        cluster_candidates = [clusters_from_config]
+        data_name = Path(train_config.data).name
+        clusters_from_data_name = Path("outputs").joinpath(data_name, "clusters.npy")
+        if clusters_from_data_name != clusters_from_config:
+            cluster_candidates.append(clusters_from_data_name)
+
+        clusters = None
+        for candidate in cluster_candidates:
+            if candidate.exists():
+                clusters = candidate
+                break
+
+        if clusters is None:
+            print("clusters file", clusters_from_config)
+            print(f"clusters.npy file does not exist at any known path: {cluster_candidates}\nProceed with interactive clustering.")
+            self.cluster_from_file = None
+        else:
+            print("clusters file", clusters)
+            self.cluster_from_file = np.load(clusters, allow_pickle=True)
 
         assert self.pipeline.datamanager.train_dataset is not None
         dataset_scale = self.pipeline.datamanager.train_dataset._dataparser_outputs.dataparser_scale
@@ -220,15 +236,45 @@ class Optimizer:
             render_lock=self.viewer_ns.train_lock,
         )
     def _cluster_from_file(self):
-        self.keep_inds = self.cluster_from_file[1]
-        self.pipeline.model.keep_inds = self.cluster_from_file[1]
-        self.pipeline.model.cluster_labels = self.cluster_from_file[0]
+        model_num_points = int(self.pipeline.model.gauss_params["means"].shape[0])
+
+        cluster_labels = torch.as_tensor(
+            self.cluster_from_file[0],
+            device=self.pipeline.model.gauss_params["means"].device,
+            dtype=torch.float32,
+        ).reshape(-1)
+
+        if cluster_labels.shape[0] != model_num_points:
+            raise ValueError(
+                f"clusters.npy label count mismatch (cache={cluster_labels.shape[0]}, model={model_num_points}).\n"
+                "CRITICAL ARCHITECTURE ISSUE: Gaussian point indices change between training runs. "
+                "You cannot pad/truncate or reuse an old cluster cache for a new NeRF checkpoint, "
+                "because it scrambles the object mask, causing the tracker to track random background points.\n"
+                "You MUST re-export the cluster via ns-viewer for this specific episode config."
+            )
+
+        keep_inds = torch.as_tensor(
+            self.cluster_from_file[1],
+            device=cluster_labels.device,
+        )
+        if keep_inds.dtype == torch.bool:
+            keep_inds = torch.nonzero(keep_inds.reshape(-1), as_tuple=False).reshape(-1)
+        else:
+            keep_inds = keep_inds.reshape(-1).to(torch.long)
+
+        keep_inds = keep_inds[(keep_inds >= 0) & (keep_inds < model_num_points)]
+        if keep_inds.numel() == 0:
+            print("Warning: clusters.npy keep indices are empty after validation. Using all points.")
+            keep_inds = torch.arange(model_num_points, device=cluster_labels.device, dtype=torch.long)
+
+        self.keep_inds = keep_inds
+        self.pipeline.model.keep_inds = keep_inds
+        self.pipeline.model.cluster_labels = cluster_labels
         self.tfs = self.cluster_from_file[2] # (n,7) quat-pos
         self.pipeline.cgtf_stack = self.cluster_from_file[2]
         self.pipeline.model.cgtf_stack = self.cluster_from_file[2]
-        keep_inds_mask = torch.zeros_like(self.pipeline.model.cluster_labels)
+        keep_inds_mask = torch.zeros_like(self.pipeline.model.cluster_labels, dtype=torch.bool)
         keep_inds_mask[self.keep_inds] = 1
-        keep_inds_mask = keep_inds_mask.to(torch.bool)
         
         cluster_labels = self.pipeline.model.cluster_labels[self.keep_inds].to(torch.int32)
         cluster_labels_global = self.pipeline.model.cluster_labels.to(torch.int32)

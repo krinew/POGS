@@ -95,7 +95,7 @@ python pogs/scripts/generate_pogs_act_dataset.py \
   --raw-root /home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters/data/rlbench/raw/train \
   --pogs-config outputs/shared/pogs/2026-04-03_010833/config.yml \
   --out-dir exports/act_datasets/ \
-  --pointnet2-ckpt /home/pi0/POGS-ACT-implementation/POGS/Pointnet_Pointnet2_pytorch/log/sem_seg/pointnet2_sem_seg/checkpoints/best_model.pth
+  --pointnet2-ckpt /home/pi0/POGS-ACT-implementation/POGS/Pointnet_Pointnet2_pytorch/log/part_seg/pointnet2_part_seg_msg/checkpoints/best_model.pth
 ```
 
 ### Important Notes on Dataset Generation:
@@ -132,3 +132,6 @@ python pogs/scripts/generate_pogs_act_dataset.py \
      * It tracks the ground-truth action the robotic arm executed.
      * It constructs the payload dictionary. Our custom-injected `obs_embeds: (T, 1024)` sits right at the top.
      * It outputs `exports/act_datasets/episode0.pkl`, which acts as the ultimate master file that your ACT policy script requires!
+
+
+cache=1189336, model=1183023
