@@ -690,7 +690,14 @@ class POGSPipeline(VanillaPipeline):
     
     def _export_visible_gaussians(self, button: ViewerButton):
         """Export the visible gaussians to a .ply file"""
-        output_dir = f"outputs/{self.datamanager.config.dataparser.data.name}"
+        # Create output directory based on the dataset name (e.g., outputs/ep_0 or outputs/open_drawer_ep_0)
+        task_name = self.datamanager.config.dataparser.data.parent.name
+        ep_name = self.datamanager.config.dataparser.data.name
+        output_dir = f"outputs/{task_name}_{ep_name}"
+        
+        # Ensure the directory exists so open3d doesn't crash
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
         segmented_filename = Path(output_dir) / f"prime_seg_gaussians.ply"
         full_filename = Path(output_dir) / f"prime_full_gaussians.ply"
 

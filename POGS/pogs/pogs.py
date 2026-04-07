@@ -178,7 +178,7 @@ class POGSModel(SplatfactoModel):
         self.temp_opacities = None
         self.frame_on_word = ViewerButton("Best Guess", cb_hook=self.localize_query_cb)
         self.relevancy_thresh = ViewerSlider("Relevancy Thresh", 0.0, 0, 1.0, 0.01)
-        self.cluster_eps = ViewerSlider("Cluster Eps", 0.012, 0.005, 0.1, 0.005)
+        self.cluster_eps = ViewerSlider("Cluster Eps", 0.005, 0.001, 0.1, 0.001)
         
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
@@ -858,10 +858,11 @@ class POGSModel(SplatfactoModel):
         print(f"Clustering {group_feats_downsampled.shape[0]} gaussians... ", end="", flush=True)
 
         # Run cuml-based HDBSCAN
+        # We restore the safer defaults but multiply the epsilon to make it look exclusively at very tight similarities.
         clusterer = HDBSCAN(
-            cluster_selection_epsilon=eps,
-            min_samples=30,
-            min_cluster_size=70,
+            cluster_selection_epsilon=eps * 0.5, # Stricter epsilon
+            min_samples=30, # Back to a stable noise rejection level
+            min_cluster_size=75, # Large enough to avoid "salt and pepper" noise
             allow_single_cluster=False,
         ).fit(group_feats_downsampled)
 
