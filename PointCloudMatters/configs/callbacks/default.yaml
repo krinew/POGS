@@ -4,7 +4,6 @@ defaults:
   - model_summary
   - rich_progress_bar
   - lr_monitor
-  - device_stats_monitor
   - _self_
 
 model_checkpoint:

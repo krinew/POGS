@@ -1,6 +1,8 @@
 _target_: src.models.rlbench_act_bc_module.RLBenchACTBCModule
 
 temporal_agg: true
+proprio_embed_check_every_n_steps: 50
+proprio_embed_check_on_val: true
 
 optimizer:
   type: AdamW
@@ -19,7 +21,7 @@ lr_scheduler:
   frequency: 1
 
 policy:
-  _target_: src.models.components.act.act.ACTRLBenchPCD
+  _target_: src.models.components.act.pointnet2_act.ACTRLBenchPointNet2
   backbone: 
   transformer:
     _target_: src.models.components.act.transformer.Transformer
@@ -95,4 +97,4 @@ best_val_metrics:
   input_keys:
     - val/loss
   output_keys:
-    - val/loss
+    - val/loss_best
