@@ -173,7 +173,9 @@ def main() -> None:
     parser.add_argument("--pointnet2-ckpt", required=True, help="Path to pretrained PointNet++ checkpoint")
     parser.add_argument("--task", default="open_drawer")
     parser.add_argument("--data-root", required=True, help="Raw RLBench split root, e.g. data/rlbench/raw/val")
-    parser.add_argument("--episodes", type=int, default=25)
+    parser.add_argument("--episodes", type=int, default=1, help="Number of episodes to run (compatibility alias for --max-episodes)")
+    parser.add_argument("--start-episode", type=int, default=1)
+    parser.add_argument("--max-episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--camera", default="front")
     parser.add_argument("--max-points", type=int, default=8192)
@@ -257,9 +259,11 @@ def main() -> None:
                 episode_ids.append(int(d.name.replace("episode", "")))
             except ValueError:
                 continue
-    episode_ids = episode_ids[: args.episodes]
+    episode_ids = [eid for eid in episode_ids if eid >= args.start_episode]
+    max_count = args.max_episodes if args.max_episodes > 0 else args.episodes
+    episode_ids = episode_ids[:max_count]
     if not episode_ids:
-        raise RuntimeError(f"No episodes found under {episodes_root}")
+        raise RuntimeError(f"No episodes found under {episodes_root} with start_episode={args.start_episode}")
 
     first_ep = episode_ids[0]
     var_path = episodes_root / f"episode{first_ep}" / "variation_number.pkl"

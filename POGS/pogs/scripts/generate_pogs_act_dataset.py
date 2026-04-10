@@ -284,6 +284,25 @@ def obs_to_tensors(obs, camera: str, device: str, match_size: tuple[int, int] = 
     )
 
 
+def _to_uint8_frame(frame: np.ndarray) -> np.ndarray:
+    """Convert a frame array to uint8 HxWx3 for video writing."""
+    if frame.ndim == 4 and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.ndim == 2:
+        frame = np.repeat(frame[..., None], 3, axis=-1)
+    elif frame.ndim == 3 and frame.shape[-1] == 1:
+        frame = np.repeat(frame, 3, axis=-1)
+    elif frame.ndim == 3 and frame.shape[-1] == 4:
+        frame = frame[..., :3]
+
+    if frame.dtype != np.uint8:
+        frame = frame.astype(np.float32)
+        if frame.size > 0 and float(frame.max()) <= 1.0 + 1e-6:
+            frame = frame * 255.0
+        frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
+    return frame
+
+
 def save_episode(
     out_path: Path,
     tracked_coords: list[np.ndarray],
@@ -317,18 +336,28 @@ def process_episode(
     optimizer: Optimizer,
     demo,
     out_path: Path,
+    episode_id: int,
+    task_name: str,
     camera: str,
     max_points: int,
     first_niters: int,
     niters: int,
     device: str,
     variation_id: int,
+    save_rendered_videos: bool,
+    video_out_dir: Path,
+    video_fps: int,
+    track_use_depth: bool,
+    track_use_rgb: bool,
+    wandb_run,
     encoder,
 ) -> None:
     t0 = time.time()
     dbg(
-        f"process_episode start: out_path={out_path}, camera={camera}, "
-        f"max_points={max_points}, first_niters={first_niters}, niters={niters}, variation_id={variation_id}"
+        f"process_episode start: episode_id={episode_id}, out_path={out_path}, camera={camera}, "
+        f"max_points={max_points}, first_niters={first_niters}, niters={niters}, variation_id={variation_id}, "
+        f"save_rendered_videos={save_rendered_videos}, track_use_depth={track_use_depth}, "
+        f"track_use_rgb={track_use_rgb}, wandb_enabled={wandb_run is not None}"
     )
     observations = list(demo._observations)
     dbg(f"observations count={len(observations)}")
@@ -354,17 +383,51 @@ def process_episode(
     gripper_open = []
 
     raw_frames = []
+    tracking_renders = []
 
-    for t, obs in enumerate(observations):
+    step_pbar = tqdm(
+        enumerate(observations),
+        total=len(observations),
+        desc=f"ep{episode_id} timesteps",
+        leave=False,
+    )
+    for t, obs in step_pbar:
         step_t0 = time.time()
         dbg(f"step {t + 1}/{len(observations)}: gripper_open={obs.gripper_open}")
         rgb_t, depth_t = obs_to_tensors(obs, camera, device, match_size)
-        raw_frames.append((rgb_t.cpu().numpy() * 255).astype(np.uint8))
+        if save_rendered_videos:
+            raw_frames.append(_to_uint8_frame(rgb_t.detach().cpu().numpy()))
 
         optimizer.set_observation(rgb_t, optimizer.cam2world_ns_ds, depth_t)
         niter = first_niters if t == 0 else niters
         dbg(f"calling step_opt with niter={niter}")
-        optimizer.step_opt(niter=niter)
+        step_render_dict = optimizer.step_opt(niter=niter, use_depth=track_use_depth, use_rgb=track_use_rgb)
+        step_metrics = {}
+        if isinstance(step_render_dict, dict) and "metrics" in step_render_dict:
+            maybe_metrics = step_render_dict.get("metrics", {})
+            if isinstance(maybe_metrics, dict):
+                step_metrics = maybe_metrics
+
+        if wandb_run is not None and len(step_metrics) > 0:
+            wandb_payload = {
+                "tracking/episode_id": int(episode_id),
+                "tracking/variation_id": int(variation_id),
+                "tracking/timestep": int(t),
+                "tracking/niter": int(niter),
+                "tracking/step_runtime_sec": float(time.time() - step_t0),
+            }
+            for k, v in step_metrics.items():
+                if np.isfinite(v):
+                    wandb_payload[f"tracking/{k}"] = float(v)
+            wandb_run.log(wandb_payload)
+
+        if "total_loss_last" in step_metrics:
+            step_pbar.set_postfix(
+                total_loss=f"{step_metrics['total_loss_last']:.4f}",
+                niter=niter,
+            )
+        if save_rendered_videos and "rgb" in step_render_dict:
+            tracking_renders.append(_to_uint8_frame(step_render_dict["rgb"].detach().cpu().numpy()))
         dbg("step_opt complete")
 
 
@@ -406,11 +469,22 @@ def process_episode(
         actions.append(build_action_from_obs(next_obs))
     dbg(f"built actions count={len(actions)}; action_dim={actions[0].shape[0] if actions else 'n/a'}")
 
-    # import moviepy.editor as mpy
-    # print(f"Generating raw_camera_view.mp4 with {len(raw_frames)} frames.")
-    # out_clip_raw = mpy.ImageSequenceClip(raw_frames, fps=10)
-    # out_clip_raw.write_videofile("raw_camera_view.mp4")
+    if save_rendered_videos:
+        import moviepy as mpy
 
+        video_out_dir.mkdir(parents=True, exist_ok=True)
+
+        if raw_frames:
+            raw_video_path = video_out_dir / f"{task_name}_episode{episode_id}_raw.mp4"
+            dbg(f"Generating {raw_video_path} with {len(raw_frames)} frames.")
+            raw_clip = mpy.ImageSequenceClip(raw_frames, fps=video_fps)
+            raw_clip.write_videofile(str(raw_video_path), logger=None)
+
+        if tracking_renders:
+            tracking_video_path = video_out_dir / f"{task_name}_episode{episode_id}_tracking.mp4"
+            dbg(f"Generating {tracking_video_path} with {len(tracking_renders)} frames.")
+            tracking_clip = mpy.ImageSequenceClip(tracking_renders, fps=video_fps)
+            tracking_clip.write_videofile(str(tracking_video_path), logger=None)
 
     payload = {
         "obs_embeds": np.stack(embeds, axis=0).astype(np.float32),
@@ -453,6 +527,34 @@ def main() -> None:
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pointnet2-ckpt", type=str, required=False, default=None, help="Path to pre-trained PointNet++ checkpoint (optional)")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Auto-resume dataset generation by skipping existing .pkl files")
+    parser.add_argument(
+        "--save-rendered-videos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save per-episode raw and tracked-render videos during dataset generation.",
+    )
+    parser.add_argument("--video-fps", type=int, default=10)
+    parser.add_argument("--video-out-dir", type=str, default="outputs/videos")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable WandB logging of per-timestep optimizer losses.",
+    )
+    parser.add_argument("--wandb-project", type=str, default="pogs-act-dataset")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--track-use-depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable depth loss during per-timestep tracking optimization.",
+    )
+    parser.add_argument(
+        "--track-use-rgb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable RGB loss during per-timestep tracking optimization.",
+    )
     args = parser.parse_args()
     dbg(f"args={vars(args)}")
 
@@ -466,6 +568,27 @@ def main() -> None:
     from rlbench.environment import Environment
     from rlbench.observation_config import ObservationConfig
 
+    wandb_run = None
+    if args.wandb:
+        import wandb
+        default_run_name = f"pogs_act_{args.task}_{int(time.time())}"
+        run_name = args.wandb_run_name if args.wandb_run_name else default_run_name
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            save_code=False,
+            config={
+                "task": args.task,
+                "first_niters": args.first_niters,
+                "niters": args.niters,
+                "track_use_depth": args.track_use_depth,
+                "track_use_rgb": args.track_use_rgb,
+                "max_points": args.max_points,
+                "camera": args.camera,
+            },
+        )
+        dbg(f"wandb enabled: project={args.wandb_project}, run_name={run_name}")
+
     raw_root = Path(args.raw_root)
     episodes_root = raw_root / args.task / "all_variations" / "episodes"
     dbg(f"raw_root={raw_root}")
@@ -473,7 +596,7 @@ def main() -> None:
     if not episodes_root.exists():
         raise FileNotFoundError(f"Episodes root not found: {episodes_root}")
 
-    episode_ids = [eid for eid in get_episode_ids(episodes_root) if eid >= args.start_episode]
+    episode_ids = sorted(eid for eid in get_episode_ids(episodes_root) if eid >= args.start_episode)
     if args.max_episodes > 0:
         episode_ids = episode_ids[: args.max_episodes]
     dbg(f"selected episode_ids={episode_ids}")
@@ -571,6 +694,7 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    video_out_dir = Path(args.video_out_dir)
     dbg(f"out_dir={out_dir}")
 
     print(f"Generating {len(episode_ids)} episodes for task={args.task}")
@@ -604,16 +728,27 @@ def main() -> None:
                 optimizer=optimizer,
                 demo=demo,
                 out_path=out_path,
+                episode_id=int(episode_id),
+                task_name=args.task,
                 camera=args.camera,
                 max_points=args.max_points,
                 first_niters=args.first_niters,
                 niters=args.niters,
                 device=device,
                 variation_id=int(variation_id),
+                save_rendered_videos=args.save_rendered_videos,
+                video_out_dir=video_out_dir,
+                video_fps=args.video_fps,
+                track_use_depth=args.track_use_depth,
+                track_use_rgb=args.track_use_rgb,
+                wandb_run=wandb_run,
                 encoder=encoder,
             )
             dbg(f"episode {episode_id} finished in {time.time() - episode_t0:.2f}s")
     finally:
+        if wandb_run is not None:
+            dbg("Finalizing WandB run")
+            wandb_run.finish()
         dbg("Shutting down RLBench environment")
         env.shutdown()
 

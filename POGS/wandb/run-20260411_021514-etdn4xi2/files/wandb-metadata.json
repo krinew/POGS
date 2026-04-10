@@ -1,0 +1,67 @@
+{
+  "os": "Linux-6.8.0-107-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.19",
+  "startedAt": "2026-04-10T20:45:14.399466Z",
+  "args": [
+    "--task",
+    "stack_blocks",
+    "--raw-root",
+    "/home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters/data/rlbench/raw/train",
+    "--pogs-config",
+    "outputs/stack_blocks_ep_1/pogs/2026-04-10_193325/config.yml",
+    "--out-dir",
+    "/home/pi0/POGS-ACT-implementation/POGS/PointCloudMatters/data/pogs_act_embed/train/stack_blocks",
+    "--camera",
+    "front",
+    "--pointnet2-ckpt",
+    "/home/pi0/POGS-ACT-implementation/POGS/Pointnet_Pointnet2_pytorch/log/part_seg/pointnet2_part_seg_msg/checkpoints/best_model.pth",
+    "--start-episode",
+    "1",
+    "--max-episodes",
+    "1",
+    "--first-niters",
+    "20",
+    "--niters",
+    "20",
+    "--wandb",
+    "--track-use-depth",
+    "--track-use-rgb",
+    "--save-rendered-videos",
+    "--headless"
+  ],
+  "program": "/home/pi0/POGS-ACT-implementation/POGS/POGS/pogs/scripts/generate_pogs_act_dataset.py",
+  "codePath": "POGS/pogs/scripts/generate_pogs_act_dataset.py",
+  "codePathLocal": "pogs/scripts/generate_pogs_act_dataset.py",
+  "git": {
+    "remote": "https://TheSlothThatCodes0:@github.com/krinew/POGS.git",
+    "commit": "44aba003299b8a0d93d3d9d8aaea5393c57aba23"
+  },
+  "email": "yadavsiddharth4087@gmail.com",
+  "root": "/home/pi0/POGS-ACT-implementation/POGS/POGS",
+  "host": "pi0-X299-UD4-Pro",
+  "executable": "/home/pi0/miniconda3/envs/pogs_env/bin/python",
+  "cpu_count": 12,
+  "cpu_count_logical": 24,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "982820896768",
+      "used": "721451728896"
+    }
+  },
+  "memory": {
+    "total": "134734385152"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-3024f8c7-728c-dadd-1fb7-2bca2ec6b632"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "a2lvtuvoluuc0khr78tfumt8lldho3jy"
+}

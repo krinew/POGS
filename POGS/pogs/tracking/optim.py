@@ -337,11 +337,12 @@ class Optimizer:
                 # Force everything into 1 single rigid group mask, and 0 label
                 cluster_labels_keep = torch.zeros_like(cluster_labels_keep)
                 group_masks = [torch.ones(len(cluster_labels_keep), dtype=torch.bool, device="cuda")]
+                self.pipeline.model.mapping = torch.tensor([0], dtype=torch.int32, device="cuda")
             else:
                 # If multiple transforms exist, assume they map cleanly to the sequential labels
-                group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(num_transforms)]
+                group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(len(self.pipeline.model.mapping))]
         else:
-            group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(cluster_labels_keep.max().item() + 1)]
+            group_masks = [(cid == cluster_labels_keep).cuda() for cid in range(len(self.pipeline.model.mapping))]
         
         group_masks_global = [((cid == cluster_labels_global) & keep_inds_mask).cuda() for cid in self.pipeline.model.mapping]
         self.pipeline.model.render_features = self.render_features
@@ -384,18 +385,110 @@ class Optimizer:
     def init_obj_pose(self):
         """Initialize the object pose, and render the object pose optimization process.
         Also updates `initialized` to `True`."""
+        def _frame_to_uint8(frame):
+            """Convert torch/numpy frame to uint8 HxWx3 for video writing."""
+            if isinstance(frame, torch.Tensor):
+                frame = frame.detach().cpu().numpy()
+
+            if frame.ndim == 4 and frame.shape[0] == 1:
+                frame = frame[0]
+            if frame.ndim == 2:
+                frame = np.repeat(frame[..., None], 3, axis=-1)
+            elif frame.ndim == 3 and frame.shape[-1] == 1:
+                frame = np.repeat(frame, 3, axis=-1)
+            elif frame.ndim == 3 and frame.shape[-1] == 4:
+                frame = frame[..., :3]
+
+            frame = frame.astype(np.float32)
+            if frame.size > 0 and float(frame.max()) <= 1.0 + 1e-6:
+                frame = frame * 255.0
+            return np.clip(frame, 0.0, 255.0).astype(np.uint8)
+
+        def _depth_to_uint8(frame, dmin=None, dmax=None):
+            """Convert depth map to uint8 HxWx3 grayscale for video writing."""
+            if isinstance(frame, torch.Tensor):
+                frame = frame.detach().cpu().numpy()
+
+            if frame.ndim == 4 and frame.shape[0] == 1:
+                frame = frame[0]
+            if frame.ndim == 3 and frame.shape[-1] == 1:
+                frame = frame[..., 0]
+            elif frame.ndim == 3 and frame.shape[0] == 1:
+                frame = frame[0]
+
+            frame = frame.astype(np.float32)
+            finite = np.isfinite(frame)
+            valid = finite & (frame > 0)
+            if dmin is None or dmax is None:
+                if np.any(valid):
+                    dvals = frame[valid]
+                    dmin = float(np.percentile(dvals, 2.0))
+                    dmax = float(np.percentile(dvals, 98.0))
+                else:
+                    dmin, dmax = 0.0, 1.0
+            if dmax <= dmin:
+                dmax = dmin + 1e-6
+
+            norm = (frame - dmin) / (dmax - dmin)
+            norm = np.where(finite, norm, 0.0)
+            gray = np.clip(norm, 0.0, 1.0)
+            gray_u8 = (gray * 255.0).astype(np.uint8)
+            return np.repeat(gray_u8[..., None], 3, axis=-1)
+
+        def _depth_range(frames):
+            """Compute a stable percentile range over all depth frames in a stage."""
+            vals = []
+            for frame in frames:
+                arr = frame.detach().cpu().numpy() if isinstance(frame, torch.Tensor) else np.asarray(frame)
+                if arr.ndim == 4 and arr.shape[0] == 1:
+                    arr = arr[0]
+                if arr.ndim == 3 and arr.shape[-1] == 1:
+                    arr = arr[..., 0]
+                elif arr.ndim == 3 and arr.shape[0] == 1:
+                    arr = arr[0]
+                arr = arr.astype(np.float32)
+                valid = np.isfinite(arr) & (arr > 0)
+                if np.any(valid):
+                    vals.append(arr[valid])
+            if not vals:
+                return 0.0, 1.0
+            all_vals = np.concatenate(vals, axis=0)
+            dmin = float(np.percentile(all_vals, 2.0))
+            dmax = float(np.percentile(all_vals, 98.0))
+            if dmax <= dmin:
+                dmax = dmin + 1e-6
+            return dmin, dmax
+
         # retval only matters for visualization
         start = time.time()
-        renders = self.optimizer.initialize_obj_pose(render=True,n_seeds=7)
+        renders1, renders2, raw_renders1, raw_renders2, depth_renders1, depth_renders2 = self.optimizer.initialize_obj_pose(render=True,n_seeds=7)
         print(f"Time taken for init (pose opt): {time.time() - start:.2f} s")
 
         start = time.time()
-        for idx, render in enumerate(renders):
-            if len(render)>1:
-                render = [r.detach().cpu().numpy()*255 for r in render]
-                # save video as test_camopt.mp4
-                out_clip = mpy.ImageSequenceClip(render, fps=30)  
+        render_stages = [renders1, renders2]
+        raw_stages = [raw_renders1, raw_renders2]
+        depth_stages = [depth_renders1, depth_renders2]
+        for idx, render in enumerate(render_stages):
+            if len(render) > 1:
+                render_frames = [_frame_to_uint8(r) for r in render]
+                # Save rendered Gaussian alignment video.
+                out_clip = mpy.ImageSequenceClip(render_frames, fps=30)
                 out_clip.write_videofile(f"test_camopt{idx}.mp4")
+
+                # Save raw optimizer input feed used for this initialization stage.
+                raw_feed = raw_stages[idx]
+                if len(raw_feed) > 0:
+                    raw_frames = [_frame_to_uint8(r) for r in raw_feed]
+                    raw_clip = mpy.ImageSequenceClip(raw_frames, fps=30)
+                    raw_clip.write_videofile(f"test_camopt_raw{idx}.mp4")
+
+                # Save raw optimizer depth feed used for this initialization stage.
+                depth_feed = depth_stages[idx]
+                if len(depth_feed) > 0:
+                    dmin, dmax = _depth_range(depth_feed)
+                    depth_frames = [_depth_to_uint8(d, dmin=dmin, dmax=dmax) for d in depth_feed]
+                    depth_clip = mpy.ImageSequenceClip(depth_frames, fps=30)
+                    depth_clip.write_videofile(f"test_camopt_depth{idx}.mp4")
         print(f"Time taken for init (video): {time.time() - start:.2f} s")
         
         # Assert there are no nans in part_deltas
@@ -404,10 +497,10 @@ class Optimizer:
             exit()
         self.initialized = True
 
-    def step_opt(self,niter):
+    def step_opt(self, niter, use_depth=False, use_rgb=False):
         """Run the optimizer for `niter` iterations."""
         assert self.initialized, "Please initialize the object pose first."
-        outputs = self.optimizer.step(niter=niter)
+        outputs = self.optimizer.step(niter=niter, use_depth=use_depth, use_rgb=use_rgb)
         return outputs
 
     def get_pointcloud(self) -> trimesh.PointCloud:

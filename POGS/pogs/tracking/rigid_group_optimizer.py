@@ -120,9 +120,15 @@ class RigidGroupOptimizer:
                 vtf.SO3.identity(), (gp_centroid).cpu().numpy()
             ).as_matrix()).float().cuda()
             
+            orig_cluster_id = self.pogs_model.mapping[i].item()
             # find p2cg transform for ith cg2w
+            if orig_cluster_id < len(cg2w):
+                tf_idx = orig_cluster_id
+            else:
+                tf_idx = i % len(cg2w) # fallback
+
             se3 = vtf.SE3.from_rotation_and_translation(
-                vtf.SO3(cg2w[i,:4]), cg2w[i,4:] - gp_centroid.cpu().numpy()
+                vtf.SO3(cg2w[tf_idx,:4]), cg2w[tf_idx,4:] - gp_centroid.cpu().numpy()
             )
 
             self.p2manual_tf_SE3.append(se3) # n times SE3 objects
@@ -131,6 +137,10 @@ class RigidGroupOptimizer:
     def initialize_obj_pose(self, niter=100, n_seeds=6, render=False):
         renders1 = []
         renders2 = []
+        raw_renders1 = []
+        raw_renders2 = []
+        depth_renders1 = []
+        depth_renders2 = []
         assert not self.is_initialized, "Can only initialize once"
 
         def try_opt(start_pose_adj, niter, use_depth, use_mask=False, rndr = False, use_roi = False):
@@ -147,7 +157,7 @@ class RigidGroupOptimizer:
                 tape = wp.Tape()
                 optimizer.zero_grad()
                 with tape:
-                    loss, outputs = self.get_optim_loss(self.frame, whole_pose_adj, True, use_depth, False, False, False, use_mask=use_mask, use_roi=use_roi)
+                    loss, outputs, _ = self.get_optim_loss(self.frame, whole_pose_adj, True, use_depth, False, False, False, use_mask=use_mask, use_roi=use_roi)
                 loss.backward()
                 tape.backward()
                 optimizer.step()
@@ -157,10 +167,14 @@ class RigidGroupOptimizer:
                             frame = self.frame.frame
                             outputs = self.pogs_model.get_outputs(frame.camera, tracking=True)
                             renders2.append(outputs["rgb"].detach())
+                            raw_renders2.append(frame.rgb.detach())
+                            depth_renders2.append(frame.depth.detach())
                         else:
                             frame = self.frame
                             outputs = self.pogs_model.get_outputs(frame.camera, tracking=True)
                             renders1.append(outputs["rgb"].detach())
+                            raw_renders1.append(frame.rgb.detach())
+                            depth_renders1.append(frame.depth.detach())
             self.is_initialized = True
             return loss, whole_pose_adj.data.detach()
 
@@ -178,7 +192,14 @@ class RigidGroupOptimizer:
             best_loss = loss
             # best_outputs = outputs
             best_poses = final_poses
-        self.set_observation(PosedObservation(rgb=self.frame.rgb, camera=self.frame.camera, dino_fn=self.frame._dino_fn, metric_depth_img=self.frame.depth))
+        self.set_observation(
+            PosedObservation(
+                rgb=self.frame.rgb,
+                camera=self.frame.camera,
+                dino_fn=self.frame._dino_fn,
+                metric_depth_img=self.frame.depth.squeeze(-1),
+            )
+        )
         _, best_poses = try_opt(best_poses, 70, use_depth=True, rndr=render, use_mask=self.config.use_mask_loss, use_roi=True)# do a few optimization steps with depth
         with self.render_lock:
             self.apply_to_model(
@@ -196,7 +217,7 @@ class RigidGroupOptimizer:
         del loss
         del self.frame
         torch.cuda.empty_cache()
-        return renders1, renders2
+        return renders1, renders2, raw_renders1, raw_renders2, depth_renders1, depth_renders2
     
     @property
     def objreg2objinit(self):
@@ -279,6 +300,7 @@ class RigidGroupOptimizer:
         """
         Returns a backpropable loss for the given frame
         """
+        loss_terms = {}
         feats_dict = {
             "real_rgb": [],
             "real_dino": [],
@@ -305,7 +327,7 @@ class RigidGroupOptimizer:
                 feats_dict["rendered_depth"]=outputs['depth']
 
                 if not outputs["accumulation"].any():
-                    return None
+                    return None, None, {}
             else:
                 for i in reversed(range(len(self.group_masks))):
                     camera = frame.roi_frames[i].camera
@@ -360,11 +382,14 @@ class RigidGroupOptimizer:
                         for i in range(len(self.group_masks)):
                                 feats_dict[key][i] = feats_dict[key][i].contiguous().view(-1, feats_dict[key][i].shape[-1])
                         feats_dict[key] = torch.cat(feats_dict[key])
-        if use_dino:   
-            loss = (feats_dict["real_dino"] - feats_dict["rendered_dino"]).norm(dim=-1).nanmean()
+        if use_dino:
+            dino_loss = (feats_dict["real_dino"] - feats_dict["rendered_dino"]).norm(dim=-1).nanmean()
+            loss = dino_loss
+            loss_terms["dino_loss"] = float(dino_loss.detach().item())
         if use_rgb:
             rgb_loss = (feats_dict["real_rgb"] - feats_dict["rendered_rgb"]).abs().mean()
             loss = rgb_loss
+            loss_terms["rgb_loss"] = float(rgb_loss.detach().item())
             if self.use_wandb:
                 wandb.log({"rgb_loss": rgb_loss.item()})
 
@@ -383,11 +408,14 @@ class RigidGroupOptimizer:
             if torch.isnan(pix_loss.mean()).any():
                 pass
             else:
-                loss = loss + self.config.depth_loss_mult * pix_loss.mean()
+                depth_loss = pix_loss.mean()
+                loss_terms["depth_loss"] = float(depth_loss.detach().item())
+                loss = loss + self.config.depth_loss_mult * depth_loss
         if use_mask and "real_mask" in feats_dict:
             mask_bce_loss = F.binary_cross_entropy(feats_dict["accumulation"], feats_dict["real_mask"])
             if self.use_wandb:
                 wandb.log({"mask_bce_loss": mask_bce_loss.mean().item()})
+            loss_terms["mask_bce_loss"] = float(mask_bce_loss.detach().item())
             loss = loss + 0.6 * mask_bce_loss
         
         if use_atap:
@@ -395,9 +423,11 @@ class RigidGroupOptimizer:
             atap_loss = self.atap(weights)
             if self.use_wandb:
                 wandb.log({"atap_loss": atap_loss.item()})
+            loss_terms["atap_loss"] = float(atap_loss.detach().item())
             loss = loss + atap_loss
 
-        return loss, outputs
+        loss_terms["total_loss"] = float(loss.detach().item())
+        return loss, outputs, loss_terms
         
     def step(self, niter=1, use_depth=False, use_rgb=False):
         part_scheduler = ExponentialDecayScheduler(
@@ -406,6 +436,7 @@ class RigidGroupOptimizer:
             )
         ).get_scheduler(self.part_optimizer, self.config.pose_lr)
         self.prev_part_deltas = copy.deepcopy(self.part_deltas.detach())
+        iter_loss_terms = []
         for i in range(niter):
             # renormalize rotation representation
             with torch.no_grad():
@@ -422,8 +453,10 @@ class RigidGroupOptimizer:
 
                 use_dino = True
 
-                loss, outputs = self.get_optim_loss(frame, self.part_deltas, use_dino,
+                loss, outputs, loss_terms = self.get_optim_loss(frame, self.part_deltas, use_dino,
                         use_depth, use_rgb, self.config.use_atap, self.config.mask_hands, self.config.use_mask_loss, self.config.use_roi)
+            if loss_terms:
+                iter_loss_terms.append(loss_terms)
             if loss is not None:
                 loss.backward()
                 #tape backward needs to be after loss backward since loss backward propagates gradients to the outputs of warp kernels
@@ -448,6 +481,15 @@ class RigidGroupOptimizer:
                 if self.config.use_roi:
                     outputs = self.pogs_model.get_outputs(self.frame.frame.camera, tracking=True, rgb_only=True)
         out_dict = {k:i.detach() for k,i in outputs.items()}
+        summary_metrics = {}
+        if len(iter_loss_terms) > 0:
+            metric_keys = sorted({k for terms in iter_loss_terms for k in terms.keys()})
+            for key in metric_keys:
+                vals = [terms[key] for terms in iter_loss_terms if key in terms and np.isfinite(terms[key])]
+                if len(vals) > 0:
+                    summary_metrics[f"{key}_last"] = float(vals[-1])
+                    summary_metrics[f"{key}_mean"] = float(np.mean(vals))
+        out_dict["metrics"] = summary_metrics
         del loss
         torch.cuda.empty_cache()
         return out_dict

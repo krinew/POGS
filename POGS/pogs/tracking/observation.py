@@ -67,6 +67,16 @@ class Frame:
                 depth = metric_depth_img
             else:
                 raise FileNotFoundError
+
+            # Canonicalize depth layout to HxW before resize.
+            # Inputs can arrive as HxW, HxWx1, or 1xHxW depending on caller path.
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth.squeeze(-1)
+            elif depth.ndim == 3 and depth.shape[0] == 1:
+                depth = depth.squeeze(0)
+            if depth.ndim != 2:
+                raise ValueError(f"Unexpected depth shape {tuple(depth.shape)}; expected HxW, HxWx1, or 1xHxW")
+
             depth = resize(
                             depth.unsqueeze(0),
                             (camera.height, camera.width),

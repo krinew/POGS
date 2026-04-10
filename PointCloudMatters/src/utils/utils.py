@@ -98,12 +98,13 @@ def task_wrapper(task_func: Callable) -> Callable:
 
 
 def get_metric_value(
-    metric_dict: dict[str, Any], metric_name: Optional[str]
+    metric_dict: dict[str, Any], metric_name: Optional[str], allow_missing: bool = False
 ) -> Optional[float]:
     """Safely retrieves value of the metric logged in LightningModule.
 
     :param metric_dict: A dict containing metric values.
     :param metric_name: If provided, the name of the metric to retrieve.
+    :param allow_missing: If True, return None instead of raising when metric is absent.
     :return: If a metric name was provided, the value of the metric.
     """
     if not metric_name:
@@ -111,6 +112,11 @@ def get_metric_value(
         return None
 
     if metric_name not in metric_dict:
+        if allow_missing:
+            log.warning(
+                f"Metric value not found but allowed to be missing! <metric_name={metric_name}>"
+            )
+            return None
         raise Exception(
             f"Metric value not found! <metric_name={metric_name}>\n"
             "Make sure metric name logged in LightningModule is correct!\n"
