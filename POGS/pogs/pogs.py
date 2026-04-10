@@ -376,7 +376,7 @@ class POGSModel(SplatfactoModel):
             rasterize_mode=self.config.rasterize_mode,
         )
         
-        if self.training:
+        if self.training and hasattr(self, "optimizers") and hasattr(self, "strategy_state"):
             self.info = info
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
