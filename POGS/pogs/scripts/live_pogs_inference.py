@@ -207,7 +207,9 @@ def main() -> None:
 
     obs_config = ObservationConfig()
     obs_config.set_all(False)
-    getattr(obs_config, f"{args.camera}_camera").set_all(True)
+    camera_obs_config = getattr(obs_config, f"{args.camera}_camera")
+    camera_obs_config.set_all(True)
+    camera_obs_config.depth_in_meters = True
     obs_config.gripper_pose = True
     obs_config.gripper_open = True
 
@@ -284,6 +286,9 @@ def main() -> None:
 
     print("[INFO] Constructing POGS Online Optimizer (this will take a very long time ~30s)...")
     K = np.asarray(first_obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
+    K = K.copy()
+    K[0, 0] = abs(float(K[0, 0]))
+    K[1, 1] = abs(float(K[1, 1]))
     extrinsics = np.asarray(first_obs.misc[f"{args.camera}_camera_extrinsics"], dtype=np.float32)
     init_cam_pose = torch.from_numpy(extrinsics[:3, :] if extrinsics.shape == (4, 4) else extrinsics).float().unsqueeze(0)
 
@@ -337,7 +342,7 @@ def main() -> None:
                 if dim == 2: depth = depth.squeeze(-1)
 
             optimizer.set_observation(rgb, optimizer.cam2world_ns_ds, depth)
-            optimizer.step_opt(niter=args.first_niters if step_id == 0 else args.niters)
+            optimizer.step_opt(niter=args.first_niters if step_id == 0 else args.niters, use_depth=True)
 
             coords, colors, raw_points = extract_full_scene_pointcloud(optimizer, args.max_points)
             obs_embed = encode_obs_embed(coords, colors, transform, pointnet2, device)

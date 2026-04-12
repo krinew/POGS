@@ -329,6 +329,8 @@ class RigidGroupOptimizer:
                 if not outputs["accumulation"].any():
                     return None, None, {}
             else:
+                visible_obj_count = 0
+                outputs = None
                 for i in reversed(range(len(self.group_masks))):
                     camera = frame.roi_frames[i].camera
                     if not use_dino: render_rgb_only = True 
@@ -336,13 +338,24 @@ class RigidGroupOptimizer:
                     outputs = self.pogs_model.get_outputs(camera, tracking=True, obj_id=i, BLOCK_WIDTH=8, rgb_only=render_rgb_only)
 
                     out_mask = (outputs['accumulation'] > 0.85)
+                    if not bool(out_mask.any().item()):
+                        # This rigid group is currently out of view; skip it for this optimization step.
+                        continue
+                    visible_obj_count += 1
                                             
                     valids = (out_mask.squeeze(-1) & (~frame.roi_frames[i].depth.isnan().squeeze(-1)))
                     
                     feats_dict["real_rgb"].append(frame.roi_frames[i].rgb)
                     if use_depth:
                         real_depth = frame.roi_frames[i].depth
-                        valid_depths = kornia.morphology.erosion(valids.unsqueeze(0).unsqueeze(0).to(float),torch.ones(5,5, device=valids.device)).to(bool).squeeze(0).squeeze(0)
+                        valid_depths = kornia.morphology.erosion(
+                            valids.unsqueeze(0).unsqueeze(0).to(float),
+                            torch.ones(5, 5, device=valids.device),
+                        ).to(bool).squeeze(0).squeeze(0)
+                        if not bool(valid_depths.any().item()):
+                            # Small projected masks can vanish under erosion; keep original
+                            # valid mask in that case so depth supervision is retained.
+                            valid_depths = valids
                         depths = real_depth[valid_depths]
                         if len(depths) > 0:
                             depths_median = torch.median(depths)
@@ -353,8 +366,15 @@ class RigidGroupOptimizer:
                         masked_depth = real_depth * valid_depths.unsqueeze(-1)
                         mask_zeros = torch.where(masked_depth == 0, 0, 1)
                         masked_depth_rendered = outputs['depth'] * valid_depths.unsqueeze(-1) * mask_zeros
-                        valids = valid_depths.unsqueeze(-1) * mask_zeros
-                        valids = kornia.morphology.erosion(valids.squeeze(-1).unsqueeze(0).unsqueeze(0).to(float),torch.ones(9,9, device=valids.device)).to(bool).squeeze(0).permute(1,2,0).squeeze(-1)
+                        valids_depth = valid_depths.unsqueeze(-1) * mask_zeros
+                        eroded_valids = kornia.morphology.erosion(
+                            valids_depth.squeeze(-1).unsqueeze(0).unsqueeze(0).to(float),
+                            torch.ones(9, 9, device=valids.device),
+                        ).to(bool).squeeze(0).permute(1, 2, 0).squeeze(-1)
+                        if bool(eroded_valids.any().item()):
+                            valids = eroded_valids
+                        else:
+                            valids = valids_depth.squeeze(-1).to(bool)
                         masked_depth = masked_depth * valids.unsqueeze(-1)
                         masked_depth_rendered = masked_depth_rendered * valids.unsqueeze(-1)
                         feats_dict['valids'].append(valids.unsqueeze(-1))
@@ -377,10 +397,13 @@ class RigidGroupOptimizer:
                     accum = outputs['accumulation']
                     feats_dict["accumulation"].append(accum.to(torch.float32))                    
 
+                if visible_obj_count == 0:
+                    return None, None, {"empty_visible_groups": 1.0}
+
                 for key in feats_dict.keys():
                     if len(feats_dict[key]) > 0:
-                        for i in range(len(self.group_masks)):
-                                feats_dict[key][i] = feats_dict[key][i].contiguous().view(-1, feats_dict[key][i].shape[-1])
+                        for i in range(len(feats_dict[key])):
+                            feats_dict[key][i] = feats_dict[key][i].contiguous().view(-1, feats_dict[key][i].shape[-1])
                         feats_dict[key] = torch.cat(feats_dict[key])
         if use_dino:
             dino_loss = (feats_dict["real_dino"] - feats_dict["rendered_dino"]).norm(dim=-1).nanmean()
@@ -399,17 +422,22 @@ class RigidGroupOptimizer:
             physical_depth = feats_dict["rendered_depth"] / self.dataset_scale
             valids = feats_dict['valids']
 
-            physical_depth_clamped = torch.clamp(physical_depth, min=1e-8, max=1.0)[valids]
-            real_depth_clamped = torch.clamp(feats_dict["real_depth"], min=1e-8, max=1.0)[valids]
-            pix_loss = (physical_depth_clamped - real_depth_clamped) ** 2
-            pix_loss = pix_loss[(pix_loss < self.config.depth_ignore_threshold**2)]
+            physical_depth_clamped = torch.clamp(physical_depth, min=1e-8)[valids]
+            real_depth_clamped = torch.clamp(feats_dict["real_depth"], min=1e-8)[valids]
+            full_pix_loss = (physical_depth_clamped - real_depth_clamped) ** 2
+            pix_loss = full_pix_loss[(full_pix_loss < self.config.depth_ignore_threshold**2)]
+            if pix_loss.numel() == 0:
+                # If thresholding rejects everything, fall back to all valid depth pixels
+                # so depth supervision does not silently turn off.
+                pix_loss = full_pix_loss
             if self.use_wandb:
                 wandb.log({"depth_loss": pix_loss.mean().item()})
-            if torch.isnan(pix_loss.mean()).any():
+            if pix_loss.numel() == 0 or torch.isnan(pix_loss.mean()).any():
                 pass
             else:
                 depth_loss = pix_loss.mean()
                 loss_terms["depth_loss"] = float(depth_loss.detach().item())
+                loss_terms["depth_valid_count"] = float(pix_loss.numel())
                 loss = loss + self.config.depth_loss_mult * depth_loss
         if use_mask and "real_mask" in feats_dict:
             mask_bce_loss = F.binary_cross_entropy(feats_dict["accumulation"], feats_dict["real_mask"])
@@ -585,16 +613,9 @@ class RigidGroupOptimizer:
         """
         with torch.no_grad():
             outputs = self.pogs_model.get_outputs(cam,tracking=True, obj_id=obj_id, BLOCK_WIDTH=8, rgb_only=True)
-            object_mask = outputs["accumulation"] > 0.1
+            object_mask = outputs["accumulation"] > 0.9
             if ~object_mask.any():
-                print(f"WARNING [render_mask]: object {obj_id} accumulation > 0.1 has NO pixels.")
-                print(f"Max accumulation is: {outputs['accumulation'].max().item()}")
-                print(f"Min accumulation is: {outputs['accumulation'].min().item()}")
-                print(f"Total accumulation sum is: {outputs['accumulation'].sum().item()}")
-                # Optional: check cam position
-                print(f"Camera pose (cam.camera_to_worlds):\n{cam.camera_to_worlds}")
-                # We do not raise an error here anymore
-
+                print(f"WARNING [render_mask]: object {obj_id} accumulation mask is empty at threshold 0.9")
             return object_mask
         
     def calculate_roi(self, obj_id: int, cam: Cameras = None):
@@ -609,10 +630,38 @@ class RigidGroupOptimizer:
 
             valids = torch.where(object_mask)
             if len(valids[0]) == 0:
-                print(f"WARNING [calculate_roi]: empty mask for obj {obj_id}, defaulting to full image (0.0 to 1.0).")
-                print(f"DEBUG: object_mask shape {object_mask.shape}, sum {object_mask.sum().item()}, min {object_mask.min().item()}, max {object_mask.max().item()}")
+                # If this object momentarily drops out, reuse the previous ROI for
+                # this object instead of silently optimizing over the full frame.
+                if hasattr(self, "frame") and isinstance(self.frame, PosedObservation):
+                    try:
+                        prev_roi = self.frame.roi_frames[obj_id]
+                        if cam is not None:
+                            cam_w = float(cam.width.item() if isinstance(cam.width, torch.Tensor) else cam.width)
+                            cam_h = float(cam.height.item() if isinstance(cam.height, torch.Tensor) else cam.height)
+                        else:
+                            frame_cam = self.frame.frame.camera
+                            cam_w = float(frame_cam.width.item() if isinstance(frame_cam.width, torch.Tensor) else frame_cam.width)
+                            cam_h = float(frame_cam.height.item() if isinstance(frame_cam.height, torch.Tensor) else frame_cam.height)
+                        if cam_w > 1 and cam_h > 1:
+                            xmin = float(prev_roi.xmin) / (cam_w - 1.0)
+                            xmax = float(prev_roi.xmax) / (cam_w - 1.0)
+                            ymin = float(prev_roi.ymin) / (cam_h - 1.0)
+                            ymax = float(prev_roi.ymax) / (cam_h - 1.0)
+                            xmin = max(0.0, min(1.0, xmin))
+                            xmax = max(0.0, min(1.0, xmax))
+                            ymin = max(0.0, min(1.0, ymin))
+                            ymax = max(0.0, min(1.0, ymax))
+                            if xmin < xmax and ymin < ymax:
+                                print(f"WARNING [calculate_roi]: empty mask for obj {obj_id}; reusing previous ROI.")
+                                return xmin, xmax, ymin, ymax
+                    except Exception:
+                        pass
+                print(
+                    f"WARNING [calculate_roi]: empty mask for obj {obj_id} with no previous ROI; "
+                    "falling back to full-frame ROI for this step."
+                )
                 return 0.0, 1.0, 0.0, 1.0
-            
+
             valid_xs = valids[1]/object_mask.shape[1]
             valid_ys = valids[0]/object_mask.shape[0] # normalize to 0-1
 

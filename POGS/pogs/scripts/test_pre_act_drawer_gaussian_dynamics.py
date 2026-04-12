@@ -309,7 +309,7 @@ def _tracking_loss_proxy(optimizer: Optimizer, use_depth: bool = False) -> float
     # This is the same DINO-driven objective used inside the optimizer step.
     frame = optimizer.optimizer.frame if optimizer.optimizer.config.use_roi else optimizer.optimizer.frame.frame
     with torch.no_grad():
-        loss, _ = optimizer.optimizer.get_optim_loss(
+        loss, _, _ = optimizer.optimizer.get_optim_loss(
             frame=frame,
             part_deltas=optimizer.optimizer.part_deltas.detach().clone(),
             use_dino=True,
@@ -336,6 +336,12 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=8192)
     parser.add_argument("--first-niters", type=int, default=15)
     parser.add_argument("--niters", type=int, default=5)
+    parser.add_argument(
+        "--track-use-depth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable depth loss during per-frame tracking optimization in this diagnostic replay.",
+    )
     parser.add_argument("--opacity-threshold", type=float, default=0.05)
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
 
@@ -379,7 +385,9 @@ def main() -> None:
 
     obs_config = ObservationConfig()
     obs_config.set_all(False)
-    getattr(obs_config, f"{args.camera}_camera").set_all(True)
+    camera_obs_config = getattr(obs_config, f"{args.camera}_camera")
+    camera_obs_config.set_all(True)
+    camera_obs_config.depth_in_meters = True
     obs_config.gripper_pose = True
     obs_config.gripper_open = True
 
@@ -425,6 +433,9 @@ def main() -> None:
             max_frames = min(max_frames, int(args.max_steps) + 1)
 
         K = np.asarray(obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
+        K = K.copy()
+        K[0, 0] = abs(float(K[0, 0]))
+        K[1, 1] = abs(float(K[1, 1]))
         extr = np.asarray(obs.misc[f"{args.camera}_camera_extrinsics"], dtype=np.float32)
         if extr.shape == (4, 4):
             init_cam_pose = torch.from_numpy(extr[:3, :]).float().unsqueeze(0)
@@ -469,10 +480,18 @@ def main() -> None:
             do_2d_check = (frame_idx % verify_every == 0)
             loss_before = float("nan")
             if do_2d_check:
-                loss_before = _tracking_loss_proxy(optimizer, use_depth=False)
+                loss_before = _tracking_loss_proxy(optimizer, use_depth=bool(args.track_use_depth))
 
             part_before = optimizer.optimizer.part_deltas.detach().clone()
-            optimizer.step_opt(niter=args.first_niters if frame_idx == 0 else args.niters)
+            step_render_dict = optimizer.step_opt(
+                niter=args.first_niters if frame_idx == 0 else args.niters,
+                use_depth=bool(args.track_use_depth),
+            )
+            step_metrics = {}
+            if isinstance(step_render_dict, dict):
+                maybe_metrics = step_render_dict.get("metrics", {})
+                if isinstance(maybe_metrics, dict):
+                    step_metrics = maybe_metrics
             part_after = optimizer.optimizer.part_deltas.detach().clone()
             part_delta_step = float(torch.linalg.norm(part_after - part_before).item())
 
@@ -480,7 +499,7 @@ def main() -> None:
             loss_drop = float("nan")
             improved = False
             if do_2d_check:
-                loss_after = _tracking_loss_proxy(optimizer, use_depth=False)
+                loss_after = _tracking_loss_proxy(optimizer, use_depth=bool(args.track_use_depth))
                 if np.isfinite(loss_before) and np.isfinite(loss_after):
                     loss_drop = float(loss_before - loss_after)
                     improved = bool(loss_drop > 0.0)
@@ -491,6 +510,12 @@ def main() -> None:
                         "dino_loss_after": float(loss_after),
                         "dino_loss_drop": float(loss_drop) if np.isfinite(loss_drop) else float("nan"),
                         "part_delta_step_l2": part_delta_step,
+                        "opt_total_loss_last": float(step_metrics.get("total_loss_last", float("nan"))),
+                        "opt_total_loss_mean": float(step_metrics.get("total_loss_mean", float("nan"))),
+                        "opt_dino_loss_last": float(step_metrics.get("dino_loss_last", float("nan"))),
+                        "opt_dino_loss_mean": float(step_metrics.get("dino_loss_mean", float("nan"))),
+                        "opt_depth_loss_last": float(step_metrics.get("depth_loss_last", float("nan"))),
+                        "opt_depth_loss_mean": float(step_metrics.get("depth_loss_mean", float("nan"))),
                         "improved": bool(improved),
                     }
                 )
@@ -525,6 +550,14 @@ def main() -> None:
                         f"part_delta_l2={part_delta_step:.6f} "
                         f"status={trend}"
                     )
+                    if step_metrics:
+                        print(
+                            "[VERIFY_OPT] "
+                            f"frame={frame_idx:03d} "
+                            f"opt_total_last={float(step_metrics.get('total_loss_last', float('nan'))):.6f} "
+                            f"opt_dino_last={float(step_metrics.get('dino_loss_last', float('nan'))):.6f} "
+                            f"opt_depth_last={float(step_metrics.get('depth_loss_last', float('nan'))):.6f}"
+                        )
 
             if frame_idx == max_frames - 1:
                 break

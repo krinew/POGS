@@ -546,8 +546,8 @@ def main() -> None:
     parser.add_argument(
         "--track-use-depth",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable depth loss during per-timestep tracking optimization.",
+        default=True,
+        help="Enable depth loss during per-timestep tracking optimization (default: on for POGS parity).",
     )
     parser.add_argument(
         "--track-use-rgb",
@@ -605,9 +605,13 @@ def main() -> None:
 
     obs_config = ObservationConfig()
     obs_config.set_all(False)
-    getattr(obs_config, f"{args.camera}_camera").set_all(True)
+    camera_obs_config = getattr(obs_config, f"{args.camera}_camera")
+    camera_obs_config.set_all(True)
+    # POGS tracking expects metric depth from the live stereo stream.
+    camera_obs_config.depth_in_meters = True
     obs_config.gripper_pose = True
     obs_config.gripper_open = True
+    dbg(f"{args.camera}_camera.depth_in_meters={camera_obs_config.depth_in_meters}")
 
     env = Environment(
         action_mode=MoveArmThenGripper(
@@ -645,9 +649,14 @@ def main() -> None:
     first_obs = first_demo._observations[0]
     dbg(f"first observation loaded for episode {first_ep}")
 
-    K = np.asarray(first_obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
+    K_raw = np.asarray(first_obs.misc[f"{args.camera}_camera_intrinsics"], dtype=np.float32)
+    K = K_raw.copy()
+    # RLBench front-camera intrinsics can report negative focal lengths.
+    K[0, 0] = abs(float(K[0, 0]))
+    K[1, 1] = abs(float(K[1, 1]))
     extrinsics = np.asarray(first_obs.misc[f"{args.camera}_camera_extrinsics"], dtype=np.float32)
-    print(f"Extracted camera intrinsics K (abs focal lengths):\n{K}")
+    print(f"Extracted camera intrinsics K (raw):\n{K_raw}")
+    print(f"Tracking camera intrinsics K (abs focal lengths):\n{K}")
     print(f"Raw RLBench extrinsics (PyRep c2w):\n{extrinsics}")
     dbg(f"K shape={K.shape}, extrinsics shape={extrinsics.shape}")
 

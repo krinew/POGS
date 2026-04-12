@@ -131,13 +131,20 @@ class Optimizer:
         self.init_cam_pose = deepcopy(init_cam_pose)
 
         # For nerfstudio, feed the camera as:
-        #  - opengl format
+        #  - OpenGL convention with a proper right-handed rotation matrix
         #  - in nerfstudio scale
         #  - as `Cameras` object
         #  - with `MATCH_RESOLUTION` resolution.
+        #
+        # RLBench camera extrinsics in this pipeline require X+Z sign flip to map
+        # into the OpenGL camera convention used by nerfstudio. Using Y+Z flip
+        # (Rx(pi)) can invert the image upright direction and destabilize tracking.
+        opengl_xz_flip = torch.eye(4, dtype=torch.float32)
+        opengl_xz_flip[0, 0] = -1.0
+        opengl_xz_flip[2, 2] = -1.0
         init_cam_ns = torch.cat([
             init_cam_pose[0], torch.tensor([0, 0, 0, 1], dtype=torch.float32).reshape(1, 4)
-        ], dim=0) @ (torch.from_numpy(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])).float())
+        ], dim=0) @ opengl_xz_flip
         init_cam_ns = init_cam_ns[None, :3, :]
         init_cam_ns[:, :3, 3] = init_cam_ns[:, :3, 3] * dataset_scale  # convert to meters
         assert init_cam_ns.shape == (1, 3, 4)
