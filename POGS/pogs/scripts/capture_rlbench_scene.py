@@ -28,6 +28,7 @@ import math
 import os
 import sys
 import pickle
+import random
 import time
 
 import numpy as np
@@ -198,6 +199,14 @@ NERF_FRAME_TO_IMAGE_FRAME = np.array([
 ], dtype=np.float64)
 
 
+def _set_seed(seed: int | None) -> None:
+    """Set deterministic seeds for capture-time random sampling."""
+    if seed is None:
+        return
+    np.random.seed(int(seed))
+    random.seed(int(seed))
+
+
 # ---------------------------------------------------------------------------
 # Main capture logic
 # ---------------------------------------------------------------------------
@@ -211,6 +220,10 @@ def capture_scene(args):
     from rlbench.action_modes.arm_action_modes import JointVelocity
     from rlbench.action_modes.gripper_action_modes import Discrete
     from rlbench.observation_config import ObservationConfig
+
+    _set_seed(args.seed)
+    if args.seed is not None:
+        print(f"[Capture] Using deterministic seed={int(args.seed)}")
 
     # ------------------------------------------------------------------
     # 1. Launch RLBench environment with the GUI (headless=False)
@@ -506,6 +519,12 @@ def main():
     )
     parser.add_argument("--image-w",    type=int, default=1280)
     parser.add_argument("--image-h",    type=int, default=720)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for deterministic sparse-point sampling during capture.",
+    )
     args = parser.parse_args()
 
     capture_scene(args)

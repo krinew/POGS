@@ -309,32 +309,27 @@ class Optimizer:
     
     def _setup_crops_and_groups(self) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Set up the crops and groups for the optimizer, interactively."""
-        if self.cluster_from_file is not None: # load cached cluster file, otherwise, interactively cluster
-            try:
-                if getattr(self.pipeline.model, "best_scales") is None:
-                    raise TypeError
-                cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_from_file()
-                print("Model populated. Clustered from cache file")
-            except TypeError:
-                print("Model not populated yet. Please wait...")
-                # Wait for the user to set up the crops and groups.
-                while getattr(self.pipeline.model, "best_scales") is None:
-                    time.sleep(0.1)
-                cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_from_file()
-                print("Model populated. Clustered from cache file")
+        if self.cluster_from_file is not None:  # load cached cluster file, otherwise cluster interactively
+            # Cached clusters do not require `best_scales`; waiting on it can deadlock
+            # in headless runs where the viewer never triggers the relevancy pass.
+            cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_from_file()
+            print("Model populated. Clustered from cache file")
         else:
-            try:
-                if getattr(self.pipeline.model, "best_scales") is None:
-                    raise TypeError
-                cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_interactively()
-                print("Clustered interactively")
-            except TypeError:
+            wait_timeout_s = 30.0
+            wait_start = time.time()
+            if getattr(self.pipeline.model, "best_scales") is None:
                 print("Model not populated yet. Please wait...")
-                # Wait for the user to set up the crops and groups.
-                while getattr(self.pipeline.model, "best_scales") is None:
+                while getattr(self.pipeline.model, "best_scales") is None and (time.time() - wait_start) < wait_timeout_s:
                     time.sleep(0.1)
-                cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_interactively()
-                print("Clustered interactively")
+
+            if getattr(self.pipeline.model, "best_scales") is None:
+                raise RuntimeError(
+                    "Model did not populate for interactive clustering within timeout. "
+                    "Use cached clusters.npy or open the viewer to trigger model population."
+                )
+
+            cluster_labels, keep_inds_mask, cluster_labels_global = self._cluster_interactively()
+            print("Clustered interactively")
 
         self.pipeline.model.mapping, cluster_labels_keep = torch.unique(cluster_labels, return_inverse=True)
         # BUG FIX: If user combined multiple clusters into one transform crop in the UI
