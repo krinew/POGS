@@ -109,6 +109,8 @@ class Frame:
         # self._hand_mask = Future(_get_hand_mask)
         @torch.no_grad()
         def _get_mask():
+            if self.obj_mask is None:
+                raise ValueError("obj_mask is not set for this frame")
             obj_mask = resize(
                             self.obj_mask.unsqueeze(0),
                             (camera.height, camera.width),
@@ -182,6 +184,10 @@ class PosedObservation:
             camera.rescale_output_resolution(self.max_roi_resolution/max(camera.width.item(),camera.height.item()))
         depth = self._original_depth[ymin:ymax, xmin:xmax].clone().squeeze(-1)
         self._roi_frames.append(Frame(rgb, camera, self._dino_fn, depth, xmin, xmax, ymin, ymax))
+        if self._obj_masks is not None and len(self._obj_masks) > 0:
+            idx = len(self._roi_frames) - 1
+            if idx < len(self._obj_masks):
+                self._roi_frames[idx].obj_mask = self._obj_masks[idx].squeeze(0)[ymin:ymax, xmin:xmax].clone()
         
     def update_roi(self, idx, xmin, xmax, ymin, ymax):
         assert len(self._roi_frames) > idx
@@ -203,6 +209,16 @@ class PosedObservation:
         depth = self._original_depth[ymin:ymax, xmin:xmax].clone().squeeze(-1)
 
         self._roi_frames[idx] = Frame(rgb, camera, self._dino_fn, depth, xmin, xmax, ymin, ymax)
-        if len(self._obj_masks) > 0:
+        if self._obj_masks is not None and len(self._obj_masks) > 0:
+            if idx < len(self._obj_masks):
+                self._roi_frames[idx].obj_mask = self._obj_masks[idx].squeeze(0)[ymin:ymax, xmin:xmax].clone()
 
-            self._roi_frames[idx].obj_mask = self._obj_masks[idx].squeeze(0)[ymin:ymax, xmin:xmax].clone()
+    def set_obj_masks(self, obj_masks: List[torch.Tensor]) -> None:
+        """Attach full-frame object masks (one per group) for mask supervision."""
+        self._obj_masks = obj_masks
+        if len(self._roi_frames) == 0:
+            return
+        for idx, roi in enumerate(self._roi_frames):
+            if idx >= len(obj_masks):
+                break
+            roi.obj_mask = obj_masks[idx].squeeze(0)[roi.ymin:roi.ymax, roi.xmin:roi.xmax].clone()

@@ -18,6 +18,12 @@ dependencies=[
     "typeguard>=4.0.0",
     "awscli"
 ]
+
+[project.optional-dependencies]
+sam2 = [
+    "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+    "huggingface_hub"
+]
 [tool.setuptools]
 include-package-data = true
 

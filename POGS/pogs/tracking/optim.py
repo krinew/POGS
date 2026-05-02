@@ -24,6 +24,30 @@ from pogs.encoders.openclip_encoder import OpenCLIPNetwork
 import open3d as o3d
 from pogs.tracking.observation import Future
 
+
+def _patch_nerfstudio_pillow_compat() -> None:
+    """Patch nerfstudio PIL conversion for Pillow>=12 compatibility.
+
+    Nerfstudio's legacy `pil_to_numpy` uses private PIL internals that break
+    with newer Pillow versions. We override it with a safe numpy conversion.
+    """
+    try:
+        import nerfstudio.data.utils.data_utils as ns_data_utils
+        import nerfstudio.data.datasets.base_dataset as ns_base_dataset
+    except Exception:
+        return
+
+    def _safe_pil_to_numpy(pil_image):
+        arr = np.asarray(pil_image)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
+
+    ns_data_utils.pil_to_numpy = _safe_pil_to_numpy
+    # base_dataset imports pil_to_numpy directly, so patch that binding too
+    ns_base_dataset.pil_to_numpy = _safe_pil_to_numpy
+
+
 class Optimizer:
     """Wrapper around 1) RigidGroupOptimizer and 2) GraspableToadObject.
     Operates in camera frame, not world frame."""
@@ -65,7 +89,9 @@ class Optimizer:
         init_cam_pose: torch.Tensor,  # initial camera pose in OpenCV format
     ):
         self.config_path = config_path
-        
+
+        _patch_nerfstudio_pillow_compat()
+
         # Load the POGSPipeline.
         train_config, self.pipeline, _, _ = eval_setup(config_path)
         assert isinstance(self.pipeline, POGSPipeline)
@@ -350,19 +376,49 @@ class Optimizer:
         self.pipeline.model.render_features = self.render_features
         return cluster_labels_keep.int().cuda(), group_masks, group_masks_global
 
-    def set_frame(self, rgb, ns_camera, depth) -> None:
+    @staticmethod
+    def _prepare_obj_mask(mask, device: torch.device) -> torch.Tensor:
+        if isinstance(mask, torch.Tensor):
+            mask_tensor = mask
+        else:
+            mask_tensor = torch.from_numpy(np.asarray(mask))
+
+        if mask_tensor.ndim == 3 and mask_tensor.shape[-1] == 1:
+            mask_tensor = mask_tensor.squeeze(-1)
+        if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1:
+            mask_tensor = mask_tensor.squeeze(0)
+
+        mask_tensor = mask_tensor.to(device=device, dtype=torch.float32)
+        if mask_tensor.numel() > 0 and float(mask_tensor.max()) > 1.0 + 1e-6:
+            mask_tensor = mask_tensor / 255.0
+        return mask_tensor
+
+    def set_frame(self, rgb, ns_camera, depth, obj_mask=None) -> None:
         """Set the first frame for the optimizer -- doesn't optimize the poses yet."""
         target_frame_rgb = (rgb/255)
         
         frame = Frame(rgb=target_frame_rgb, camera=ns_camera, dino_fn=self.pipeline.datamanager.dino_dataloader.get_pca_feats, metric_depth_img=depth)
+        if obj_mask is not None:
+            device = rgb.device if isinstance(rgb, torch.Tensor) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            frame.obj_mask = self._prepare_obj_mask(obj_mask, device)
         
         self.optimizer.set_frame(frame)
         
-    def set_observation(self, rgb, ns_camera, depth) -> None:
+    def set_observation(self, rgb, ns_camera, depth, obj_mask=None) -> None:
         """Set the frame for the optimizer -- doesn't optimize the poses yet."""
         target_frame_rgb = (rgb/255)
         
         frame = PosedObservation(rgb=target_frame_rgb, camera=ns_camera, dino_fn=self.pipeline.datamanager.dino_dataloader.get_pca_feats, metric_depth_img=depth)
+        if obj_mask is not None:
+            device = rgb.device if isinstance(rgb, torch.Tensor) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if isinstance(obj_mask, (list, tuple)):
+                obj_masks = [self._prepare_obj_mask(mask, device) for mask in obj_mask]
+                if len(obj_masks) != self.num_groups:
+                    raise ValueError(f"Expected {self.num_groups} object masks, got {len(obj_masks)}")
+                frame.set_obj_masks(obj_masks)
+            else:
+                mask_tensor = self._prepare_obj_mask(obj_mask, device)
+                frame.set_obj_masks([mask_tensor for _ in range(self.num_groups)])
         if hasattr(self.optimizer, 'frame'):
             frame_dict = self.optimizer.frame.__dict__
             for attr in list(frame_dict.keys()):

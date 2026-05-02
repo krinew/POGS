@@ -34,10 +34,12 @@ from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion, SceneContraction
 from nerfstudio.fields.base_field import Field, get_normalized_directions
 
+TCNN_IMPORT_ERROR = None
 try:
     import tinycudann as tcnn
-except ImportError:
-    pass
+except Exception as exc:  # handles ImportError and runtime loader errors
+    tcnn = None
+    TCNN_IMPORT_ERROR = exc
 
 
 class GaussianField(Field):
@@ -85,6 +87,12 @@ class GaussianField(Field):
         feature_dims: int = 64,
     ) -> None:
         super().__init__()
+        if tcnn is None:
+            raise RuntimeError(
+                "tinycudann is unavailable for GaussianField. "
+                "Ensure CUDA-enabled torch is loaded from pogs_env and tinycudann imports cleanly. "
+                f"Original error: {type(TCNN_IMPORT_ERROR).__name__}: {TCNN_IMPORT_ERROR}"
+            )
 
         self.spatial_distortion: SceneContraction = SceneContraction()
 

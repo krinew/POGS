@@ -31,6 +31,13 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.normpath(os.path.join(_SCRIPT_DIR, "../../")))
 
 from pogs.tracking.optim import Optimizer
+from pogs.tracking.segmentation import (
+    GroundingDinoBoxer,
+    GroundingDinoConfig,
+    Sam2Segmenter,
+    Sam2Config,
+)
+from pogs.tracking.utils2 import overlay
 
 
 def task_file_to_task_class(task_file: str):
@@ -195,6 +202,314 @@ def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
+def _write_image_sequence_video(image_dir: Path, out_path: Path, fps: float) -> str:
+    image_paths = sorted(image_dir.glob("*.png"))
+    if not image_paths:
+        return ""
+
+    # Import lazily so normal rollout startup only depends on MoviePy when
+    # video export is explicitly requested.
+    import moviepy as mpy
+
+    frames = [np.asarray(Image.open(path).convert("RGB")) for path in image_paths]
+    clip = mpy.ImageSequenceClip(frames, fps=float(fps))
+    clip.write_videofile(str(out_path), logger=None)
+    return str(out_path)
+
+
+def _resize_bool_mask(mask: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    tgt_h, tgt_w = int(shape_hw[0]), int(shape_hw[1])
+    if mask.shape == (tgt_h, tgt_w):
+        return mask
+    resized = Image.fromarray(mask.astype(np.uint8) * 255).resize((tgt_w, tgt_h), resample=Image.NEAREST)
+    return np.asarray(resized) > 0
+
+
+def _collect_robot_handles() -> set[int]:
+    from pyrep.robots.arms.panda import Panda
+    from pyrep.robots.end_effectors.panda_gripper import PandaGripper
+
+    robot = Panda()
+    gripper = PandaGripper()
+    handles: set[int] = set()
+    for root in (robot, gripper):
+        try:
+            handles.add(int(root.get_handle()))
+        except Exception:
+            pass
+        for obj in root.get_objects_in_tree(exclude_base=False):
+            try:
+                handles.add(int(obj.get_handle()))
+            except Exception:
+                continue
+    return handles
+
+
+def _set_robot_renderable(renderable: bool) -> None:
+    from pyrep.robots.arms.panda import Panda
+    from pyrep.robots.end_effectors.panda_gripper import PandaGripper
+
+    robot = Panda()
+    gripper = PandaGripper()
+    for root in (robot, gripper):
+        for obj in root.get_objects_in_tree(exclude_base=False):
+            obj.set_renderable(bool(renderable))
+
+
+def _robot_exclusion_mask_from_obs(obs, camera: str, robot_handles: set[int], shape_hw: tuple[int, int]) -> np.ndarray | None:
+    if not robot_handles:
+        return None
+    sim_mask = getattr(obs, f"{camera}_mask", None)
+    if sim_mask is None:
+        return None
+
+    sim_mask = np.asarray(sim_mask)
+    if sim_mask.ndim == 3:
+        # Defensive fallback if a camera config ever emits RGB-coded handles.
+        sim_mask = (
+            sim_mask[:, :, 0].astype(np.int64)
+            + sim_mask[:, :, 1].astype(np.int64) * 256
+            + sim_mask[:, :, 2].astype(np.int64) * 256 * 256
+        )
+    robot_mask = np.isin(sim_mask.astype(np.int64), np.asarray(sorted(robot_handles), dtype=np.int64))
+    return _resize_bool_mask(robot_mask, shape_hw)
+
+
+def _filter_instances_with_exclusion(
+    instance_masks: list[np.ndarray],
+    boxes: list[list[float]],
+    exclusion_mask: np.ndarray | None,
+    max_overlap: float,
+    min_area_px: int,
+) -> tuple[list[np.ndarray], list[list[float]], dict[str, object]]:
+    if exclusion_mask is None:
+        return instance_masks, boxes, {
+            "enabled": False,
+            "dropped_instances": 0,
+            "kept_instances": len(instance_masks),
+        }
+
+    kept_masks: list[np.ndarray] = []
+    kept_boxes: list[list[float]] = []
+    dropped = 0
+    overlap_fracs: list[float] = []
+    exclusion = np.asarray(exclusion_mask, dtype=bool)
+
+    for idx, mask in enumerate(instance_masks):
+        inst = np.asarray(mask, dtype=bool)
+        if inst.shape != exclusion.shape:
+            exclusion_for_inst = _resize_bool_mask(exclusion, inst.shape)
+        else:
+            exclusion_for_inst = exclusion
+
+        inst_area = int(inst.sum())
+        if inst_area <= 0:
+            dropped += 1
+            continue
+
+        overlap = int(np.logical_and(inst, exclusion_for_inst).sum())
+        overlap_frac = float(overlap / max(inst_area, 1))
+        overlap_fracs.append(overlap_frac)
+        inst_without_robot = np.logical_and(inst, np.logical_not(exclusion_for_inst))
+
+        if overlap_frac > float(max_overlap) or int(inst_without_robot.sum()) < int(min_area_px):
+            dropped += 1
+            continue
+
+        kept_masks.append(inst_without_robot)
+        if idx < len(boxes):
+            kept_boxes.append(boxes[idx])
+
+    return kept_masks, kept_boxes, {
+        "enabled": True,
+        "dropped_instances": int(dropped),
+        "kept_instances": int(len(kept_masks)),
+        "robot_overlap_fracs": overlap_fracs,
+    }
+
+
+def _box_iou(box_a: list[float], box_b: list[float]) -> float:
+    ax0, ay0, ax1, ay1 = box_a
+    bx0, by0, bx1, by1 = box_b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    denom = area_a + area_b - inter
+    return 0.0 if denom <= 0 else inter / denom
+
+
+def _dedupe_boxes(boxes: list[list[float]], iou_threshold: float) -> list[list[float]]:
+    kept: list[list[float]] = []
+    for box in boxes:
+        if all(_box_iou(box, prev) < iou_threshold for prev in kept):
+            kept.append(box)
+    return kept
+
+
+def _parse_prompts(prompt: str, extra_prompts: list[str]) -> list[str]:
+    prompts: list[str] = []
+    for item in [prompt, *extra_prompts]:
+        prompts.extend([p.strip() for p in item.split("|") if p.strip()])
+    return prompts
+
+
+def _mask_centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.where(mask.astype(bool))
+    if len(xs) == 0:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = mask_a.astype(bool)
+    b = mask_b.astype(bool)
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    return 0.0 if union == 0 else float(inter / union)
+
+
+def _assign_instance_masks_to_groups(
+    optimizer: Optimizer,
+    instance_masks: list[np.ndarray],
+    previous_assignments: list[int | None] | None,
+    min_iou: float,
+) -> tuple[list[np.ndarray], list[int | None], list[dict[str, object]]]:
+    num_groups = optimizer.num_groups
+    cam_h = optimizer.cam2world_ns_ds.height
+    cam_w = optimizer.cam2world_ns_ds.width
+    h = int(cam_h.item() if isinstance(cam_h, torch.Tensor) else cam_h)
+    w = int(cam_w.item() if isinstance(cam_w, torch.Tensor) else cam_w)
+    render_camera = optimizer.cam2world_ns_ds.to("cuda")
+
+    group_masks: list[np.ndarray] = []
+    for group_idx in range(num_groups):
+        rendered = optimizer.optimizer.render_mask(render_camera, group_idx)
+        group_masks.append(rendered.squeeze().detach().cpu().numpy().astype(bool))
+
+    if len(instance_masks) == 0:
+        records = [{"group": int(idx), "instance": None, "iou": 0.0} for idx in range(num_groups)]
+        return [mask.copy() for mask in group_masks], [None] * num_groups, records
+
+    scores: list[tuple[float, int, int]] = []
+    for group_idx, group_mask in enumerate(group_masks):
+        for inst_idx, inst_mask in enumerate(instance_masks):
+            iou = _mask_iou(group_mask, inst_mask)
+            scores.append((iou, group_idx, inst_idx))
+
+    assignments: list[int | None] = [None] * num_groups
+    used_instances: set[int] = set()
+
+    if previous_assignments is not None:
+        for group_idx, prev_inst in enumerate(previous_assignments):
+            if prev_inst is None or prev_inst >= len(instance_masks) or prev_inst in used_instances:
+                continue
+            if _mask_iou(group_masks[group_idx], instance_masks[prev_inst]) >= min_iou:
+                assignments[group_idx] = prev_inst
+                used_instances.add(prev_inst)
+
+    for iou, group_idx, inst_idx in sorted(scores, reverse=True):
+        if iou < min_iou:
+            break
+        if assignments[group_idx] is not None or inst_idx in used_instances:
+            continue
+        assignments[group_idx] = inst_idx
+        used_instances.add(inst_idx)
+
+    inst_centroids = [_mask_centroid(mask) for mask in instance_masks]
+    for group_idx, group_mask in enumerate(group_masks):
+        if assignments[group_idx] is not None:
+            continue
+        group_centroid = _mask_centroid(group_mask)
+        if group_centroid is None:
+            continue
+        candidates = []
+        for inst_idx, inst_centroid in enumerate(inst_centroids):
+            if inst_idx in used_instances or inst_centroid is None:
+                continue
+            dist = float(np.hypot(group_centroid[0] - inst_centroid[0], group_centroid[1] - inst_centroid[1]))
+            candidates.append((dist, inst_idx))
+        if candidates:
+            _, inst_idx = min(candidates)
+            assignments[group_idx] = inst_idx
+            used_instances.add(inst_idx)
+
+    assigned_masks: list[np.ndarray] = []
+    assignment_records: list[dict[str, object]] = []
+    for group_idx, inst_idx in enumerate(assignments):
+        if inst_idx is None:
+            # Neutral target: do not push unmatched groups out of view.
+            assigned_masks.append(group_masks[group_idx].copy())
+            best_iou = 0.0
+        else:
+            assigned_masks.append(instance_masks[inst_idx].astype(bool))
+            best_iou = _mask_iou(group_masks[group_idx], instance_masks[inst_idx])
+        assignment_records.append(
+            {
+                "group": int(group_idx),
+                "instance": None if inst_idx is None else int(inst_idx),
+                "iou": float(best_iou),
+            }
+        )
+
+    return assigned_masks, assignments, assignment_records
+
+
+class GdinoSam2Masker:
+    """Online text-driven mask predictor: GroundingDINO boxes + SAM2 masks."""
+
+    def __init__(
+        self,
+        prompt: str,
+        extra_prompts: list[str],
+        gdino_model_id: str,
+        gdino_box_threshold: float,
+        gdino_text_threshold: float,
+        gdino_max_boxes: int,
+        gdino_min_box_area: float | None,
+        gdino_max_box_area: float | None,
+        gdino_dedupe_iou: float,
+        sam2_model_id: str,
+        sam2_model_cfg: str | None,
+        sam2_checkpoint: str | None,
+    ) -> None:
+        self.prompts = _parse_prompts(prompt, extra_prompts)
+        self.dedupe_iou = float(gdino_dedupe_iou)
+        self.boxer = GroundingDinoBoxer(
+            GroundingDinoConfig(
+                model_id=gdino_model_id,
+                box_threshold=gdino_box_threshold,
+                text_threshold=gdino_text_threshold,
+                max_boxes=gdino_max_boxes,
+                min_box_area=gdino_min_box_area,
+                max_box_area=gdino_max_box_area,
+            )
+        )
+        self.segmenter = Sam2Segmenter(
+            Sam2Config(
+                model_id=sam2_model_id,
+                model_cfg=sam2_model_cfg,
+                checkpoint=sam2_checkpoint,
+            )
+        )
+
+    def predict(self, image: np.ndarray) -> tuple[np.ndarray, list[list[float]], list[np.ndarray]]:
+        boxes: list[list[float]] = []
+        for prompt in self.prompts:
+            boxes.extend(self.boxer.predict_boxes(image, prompt))
+        boxes = _dedupe_boxes(boxes, self.dedupe_iou)
+        if len(boxes) == 0:
+            mask = np.zeros(image.shape[:2], dtype=bool)
+            instance_masks = []
+        else:
+            instance_masks = self.segmenter.predict_instance_masks(image, boxes)
+            mask = np.logical_or.reduce(instance_masks) if instance_masks else np.zeros(image.shape[:2], dtype=bool)
+        return mask.astype(bool), boxes, instance_masks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Random-action rollout on the same scene as a trained POGS model, with tracking diagnostics."
@@ -208,6 +523,48 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--first-niters", type=int, default=15)
     parser.add_argument("--niters", type=int, default=5)
+    parser.add_argument(
+        "--seg-mode",
+        choices=["none", "gdino-sam2"],
+        default="gdino-sam2",
+        help="Silhouette source for tracking. Use gdino-sam2 for text-driven masks.",
+    )
+    parser.add_argument("--seg-prompt", type=str, default="stacked blocks. blocks. cubes.")
+    parser.add_argument(
+        "--seg-extra-prompt",
+        action="append",
+        default=[],
+        help="Additional segmentation prompt. You can also separate prompts with '|'.",
+    )
+    parser.add_argument("--gdino-model-id", type=str, default="IDEA-Research/grounding-dino-tiny")
+    parser.add_argument("--gdino-box-threshold", type=float, default=0.2)
+    parser.add_argument("--gdino-text-threshold", type=float, default=0.2)
+    parser.add_argument("--gdino-max-boxes", type=int, default=10)
+    parser.add_argument("--gdino-min-box-area", type=float, default=None)
+    parser.add_argument("--gdino-max-box-area", type=float, default=0.25)
+    parser.add_argument("--gdino-dedupe-iou", type=float, default=0.92)
+    parser.add_argument("--seg-assignment-min-iou", type=float, default=0.01)
+    parser.add_argument("--sam2-model-id", type=str, default="facebook/sam2-hiera-large")
+    parser.add_argument("--sam2-model-cfg", type=str, default=None)
+    parser.add_argument("--sam2-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--seg-exclude-robot-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use RLBench object-ID masks to remove Panda/gripper pixels from segmentation masks.",
+    )
+    parser.add_argument(
+        "--seg-robot-overlap-drop-threshold",
+        type=float,
+        default=0.35,
+        help="Drop a detected instance if this fraction of its pixels overlap the robot object-ID mask.",
+    )
+    parser.add_argument(
+        "--seg-min-instance-area-px",
+        type=int,
+        default=16,
+        help="Drop segmentation instances smaller than this after robot-mask subtraction.",
+    )
     parser.add_argument(
         "--track-use-depth",
         action=argparse.BooleanOptionalAction,
@@ -238,6 +595,19 @@ def main() -> None:
         default=True,
         help="Save rollout RGB/depth frames under out-dir for later inspection.",
     )
+    parser.add_argument(
+        "--save-seg-debug",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save per-step binary masks, overlays, and detected boxes.",
+    )
+    parser.add_argument(
+        "--save-videos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write MP4 videos from saved RGB, tracked-render, and mask-overlay frame sequences.",
+    )
+    parser.add_argument("--video-fps", type=float, default=20.0, help="FPS for exported rollout videos.")
     parser.add_argument("--out-dir", type=str, default="outputs/random_scene_rollouts")
     parser.add_argument(
         "--strict-scene-episode",
@@ -286,6 +656,17 @@ def main() -> None:
         rgb_dir.mkdir(parents=True, exist_ok=True)
         tracked_rgb_dir.mkdir(parents=True, exist_ok=True)
         depth_dir.mkdir(parents=True, exist_ok=True)
+    mask_dir = run_dir / "mask"
+    mask_overlay_dir = run_dir / "mask_overlay"
+    instance_mask_dir = run_dir / "instance_masks"
+    assigned_mask_dir = run_dir / "assigned_group_masks"
+    robot_mask_dir = run_dir / "robot_exclusion_mask"
+    if args.save_seg_debug:
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        mask_overlay_dir.mkdir(parents=True, exist_ok=True)
+        instance_mask_dir.mkdir(parents=True, exist_ok=True)
+        assigned_mask_dir.mkdir(parents=True, exist_ok=True)
+        robot_mask_dir.mkdir(parents=True, exist_ok=True)
 
     from rlbench.action_modes.action_mode import MoveArmThenGripper
     from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
@@ -314,17 +695,17 @@ def main() -> None:
     print("[INFO] Launching RLBench environment...")
     env.launch()
 
+    robot_handles: set[int] = set()
+    if args.seg_exclude_robot_mask or args.hide_robot_from_camera:
+        try:
+            robot_handles = _collect_robot_handles()
+            print(f"[INFO] Collected {len(robot_handles)} Panda/gripper handles for robot masking.")
+        except Exception as exc:
+            print(f"[WARN] Failed to collect robot handles for masking: {exc}")
+
     if args.hide_robot_from_camera:
         try:
-            from pyrep.robots.arms.panda import Panda
-            from pyrep.robots.end_effectors.panda_gripper import PandaGripper
-
-            robot = Panda()
-            gripper = PandaGripper()
-            for obj in robot.get_objects_in_tree(exclude_base=False):
-                obj.set_renderable(False)
-            for obj in gripper.get_objects_in_tree(exclude_base=False):
-                obj.set_renderable(False)
+            _set_robot_renderable(False)
             print("[INFO] Robot renderables hidden for rollout observations.")
         except Exception as exc:
             print(f"[WARN] Failed to hide robot renderables: {exc}")
@@ -338,6 +719,24 @@ def main() -> None:
         print(f"[INFO] Using workspace clamp for task={args.task}")
     else:
         print(f"[WARN] No workspace bounds found for task={args.task}; actions are unconstrained.")
+
+    masker = None
+    if args.seg_mode == "gdino-sam2":
+        print("[INFO] Using segmentation mode: gdino-sam2")
+        masker = GdinoSam2Masker(
+            prompt=args.seg_prompt,
+            extra_prompts=args.seg_extra_prompt,
+            gdino_model_id=args.gdino_model_id,
+            gdino_box_threshold=float(args.gdino_box_threshold),
+            gdino_text_threshold=float(args.gdino_text_threshold),
+            gdino_max_boxes=int(args.gdino_max_boxes),
+            gdino_min_box_area=args.gdino_min_box_area,
+            gdino_max_box_area=args.gdino_max_box_area,
+            gdino_dedupe_iou=float(args.gdino_dedupe_iou),
+            sam2_model_id=args.sam2_model_id,
+            sam2_model_cfg=args.sam2_model_cfg,
+            sam2_checkpoint=args.sam2_checkpoint,
+        )
 
     try:
         task_cls = task_file_to_task_class(args.task)
@@ -371,7 +770,14 @@ def main() -> None:
 
         h, w = getattr(obs, f"{args.camera}_rgb").shape[:2]
         optimizer = Optimizer(config_path, K, w, h, init_cam_pose)
+        if args.seg_mode == "gdino-sam2":
+            # Keep initialization stable (no mask required there), then switch to mask-only tracking.
+            optimizer.optimizer.config.use_mask_loss = False
         target_h, target_w = _init_optimizer_for_episode(optimizer, obs, args.camera, device)
+        if args.seg_mode == "gdino-sam2":
+            optimizer.optimizer.config.use_dino_loss = False
+            optimizer.optimizer.config.use_mask_loss = True
+            print("[INFO] Tracking configured: use_dino_loss=False, use_mask_loss=True")
 
         verify_every = max(1, int(args.verify_every))
         print(
@@ -379,9 +785,55 @@ def main() -> None:
             f"task={args.task} episode={args.episode} seed={args.seed} steps={args.steps}"
         )
 
+        previous_assignments: list[int | None] | None = None
+
         for step_idx in range(int(args.steps)):
             rgb_tensor, depth_tensor = _obs_to_tensors(obs, args.camera, device, (target_h, target_w))
-            optimizer.set_observation(rgb_tensor, optimizer.cam2world_ns_ds, depth_tensor)
+            obj_mask = None
+            group_obj_masks = None
+            seg_boxes = []
+            instance_masks: list[np.ndarray] = []
+            assignment_records: list[dict[str, object]] = []
+            robot_exclusion_mask = None
+            seg_filter_record: dict[str, object] = {
+                "enabled": False,
+                "dropped_instances": 0,
+                "kept_instances": 0,
+            }
+            if masker is not None:
+                rgb_np = _to_uint8_rgb(rgb_tensor.detach().cpu().numpy())
+                obj_mask, seg_boxes, instance_masks = masker.predict(rgb_np)
+                if args.seg_exclude_robot_mask:
+                    robot_exclusion_mask = _robot_exclusion_mask_from_obs(
+                        obs=obs,
+                        camera=args.camera,
+                        robot_handles=robot_handles,
+                        shape_hw=rgb_np.shape[:2],
+                    )
+                    instance_masks, seg_boxes, seg_filter_record = _filter_instances_with_exclusion(
+                        instance_masks=instance_masks,
+                        boxes=seg_boxes,
+                        exclusion_mask=robot_exclusion_mask,
+                        max_overlap=float(args.seg_robot_overlap_drop_threshold),
+                        min_area_px=int(args.seg_min_instance_area_px),
+                    )
+                    obj_mask = (
+                        np.logical_or.reduce(instance_masks)
+                        if instance_masks
+                        else np.zeros(rgb_np.shape[:2], dtype=bool)
+                    )
+                group_obj_masks, previous_assignments, assignment_records = _assign_instance_masks_to_groups(
+                    optimizer=optimizer,
+                    instance_masks=instance_masks,
+                    previous_assignments=previous_assignments,
+                    min_iou=float(args.seg_assignment_min_iou),
+                )
+            optimizer.set_observation(
+                rgb_tensor,
+                optimizer.cam2world_ns_ds,
+                depth_tensor,
+                obj_mask=group_obj_masks if group_obj_masks is not None else obj_mask,
+            )
 
             loss_before = _tracking_loss_proxy(
                 optimizer,
@@ -424,6 +876,25 @@ def main() -> None:
                     if render_rgb.ndim == 4 and render_rgb.shape[0] == 1:
                         render_rgb = render_rgb[0]
                     Image.fromarray(_to_uint8_rgb(render_rgb)).save(tracked_rgb_dir / f"{step_idx:04d}.png")
+            if args.save_seg_debug and obj_mask is not None:
+                mask_u8 = (obj_mask.astype(np.uint8) * 255)
+                Image.fromarray(mask_u8).save(mask_dir / f"{step_idx:04d}.png")
+                rgb_u8 = _to_uint8_rgb(rgb_tensor.detach().cpu().numpy())
+                ov = overlay(rgb_u8, obj_mask.astype(np.uint8), color=(255, 0, 0), alpha=0.45)
+                Image.fromarray(ov.astype(np.uint8)).save(mask_overlay_dir / f"{step_idx:04d}.png")
+                step_instance_dir = instance_mask_dir / f"{step_idx:04d}"
+                step_instance_dir.mkdir(parents=True, exist_ok=True)
+                for inst_idx, inst_mask in enumerate(instance_masks):
+                    Image.fromarray((inst_mask.astype(np.uint8) * 255)).save(step_instance_dir / f"{inst_idx:02d}.png")
+                step_assigned_dir = assigned_mask_dir / f"{step_idx:04d}"
+                step_assigned_dir.mkdir(parents=True, exist_ok=True)
+                if group_obj_masks is not None:
+                    for group_idx, group_mask in enumerate(group_obj_masks):
+                        Image.fromarray((group_mask.astype(np.uint8) * 255)).save(step_assigned_dir / f"{group_idx:02d}.png")
+                if robot_exclusion_mask is not None:
+                    Image.fromarray((robot_exclusion_mask.astype(np.uint8) * 255)).save(
+                        robot_mask_dir / f"{step_idx:04d}.png"
+                    )
 
             row: dict[str, object] = {
                 "step": int(step_idx),
@@ -435,9 +906,15 @@ def main() -> None:
                 "opt_total_loss_last": float(step_metrics.get("total_loss_last", float("nan"))),
                 "opt_dino_loss_last": float(step_metrics.get("dino_loss_last", float("nan"))),
                 "opt_depth_loss_last": float(step_metrics.get("depth_loss_last", float("nan"))),
+                "opt_mask_bce_loss_last": float(step_metrics.get("mask_bce_loss_last", float("nan"))),
                 "reward": float("nan"),
                 "terminate": False,
                 "action_retry": -1,
+                "seg_num_boxes": int(len(seg_boxes)),
+                "seg_boxes": seg_boxes,
+                "seg_num_instances": int(len(instance_masks)),
+                "seg_filter": seg_filter_record,
+                "seg_assignments": assignment_records,
             }
 
             if step_idx == int(args.steps) - 1:
@@ -488,8 +965,10 @@ def main() -> None:
                 print(
                     "[VERIFY] "
                     f"step={step_idx:03d} "
-                    f"dino_before={float(loss_before):.6f} "
-                    f"dino_after={float(loss_after):.6f} "
+                    f"total={float(row['opt_total_loss_last']):.6f} "
+                    f"mask_bce={float(row['opt_mask_bce_loss_last']):.6f} "
+                    f"instances={int(row['seg_num_instances'])} "
+                    f"robot_dropped={int(seg_filter_record.get('dropped_instances', 0))} "
                     f"reward={float(reward):.3f} "
                     f"terminate={bool(terminate)}"
                 )
@@ -511,6 +990,29 @@ def main() -> None:
         ]
         improve_rate = float(np.mean(improved)) if improved else 0.0
 
+        video_paths: dict[str, str] = {}
+        if args.save_videos:
+            if not args.save_frames:
+                print("[WARN] --save-videos requested but --no-save-frames was set; skipping video export.")
+            else:
+                video_fps = float(args.video_fps)
+                rgb_video = _write_image_sequence_video(rgb_dir, run_dir / f"{args.camera}_rgb.mp4", video_fps)
+                if rgb_video:
+                    video_paths[f"{args.camera}_rgb"] = rgb_video
+
+                tracked_video = _write_image_sequence_video(tracked_rgb_dir, run_dir / "tracked_rgb.mp4", video_fps)
+                if tracked_video:
+                    video_paths["tracked_rgb"] = tracked_video
+
+                if args.save_seg_debug:
+                    overlay_video = _write_image_sequence_video(
+                        mask_overlay_dir,
+                        run_dir / "mask_overlay.mp4",
+                        video_fps,
+                    )
+                    if overlay_video:
+                        video_paths["mask_overlay"] = overlay_video
+
         summary = {
             "task": args.task,
             "episode": int(args.episode),
@@ -526,6 +1028,13 @@ def main() -> None:
             "termination_reason": termination_reason,
             "track_use_depth": bool(args.track_use_depth),
             "track_use_rgb": bool(args.track_use_rgb),
+            "seg_mode": args.seg_mode,
+            "seg_prompt": args.seg_prompt,
+            "seg_extra_prompt": list(args.seg_extra_prompt),
+            "seg_assignment_min_iou": float(args.seg_assignment_min_iou),
+            "seg_exclude_robot_mask": bool(args.seg_exclude_robot_mask),
+            "seg_robot_overlap_drop_threshold": float(args.seg_robot_overlap_drop_threshold),
+            "seg_min_instance_area_px": int(args.seg_min_instance_area_px),
             "first_niters": int(args.first_niters),
             "niters": int(args.niters),
             "tracking_2d_signal": {
@@ -535,6 +1044,12 @@ def main() -> None:
             "frames_dir": str(rgb_dir) if args.save_frames else "",
             "tracked_frames_dir": str(tracked_rgb_dir) if args.save_frames else "",
             "depth_dir": str(depth_dir) if args.save_frames else "",
+            "mask_dir": str(mask_dir) if args.save_seg_debug else "",
+            "mask_overlay_dir": str(mask_overlay_dir) if args.save_seg_debug else "",
+            "instance_mask_dir": str(instance_mask_dir) if args.save_seg_debug else "",
+            "assigned_mask_dir": str(assigned_mask_dir) if args.save_seg_debug else "",
+            "robot_mask_dir": str(robot_mask_dir) if args.save_seg_debug else "",
+            "video_paths": video_paths,
             "rows": rollout_rows,
         }
 
@@ -547,6 +1062,8 @@ def main() -> None:
             print(f"[INFO] Saved RGB frames: {rgb_dir}")
             print(f"[INFO] Saved tracked renders: {tracked_rgb_dir}")
             print(f"[INFO] Saved depth frames: {depth_dir}")
+        for name, path in video_paths.items():
+            print(f"[INFO] Saved {name} video: {path}")
     finally:
         env.shutdown()
 
