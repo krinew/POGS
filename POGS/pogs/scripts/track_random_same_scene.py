@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import warp as wp
 from PIL import Image
 from pyrep.errors import ConfigurationPathError, IKError
 from rlbench.backend.exceptions import InvalidActionError
@@ -88,14 +89,25 @@ def _obs_to_tensors(obs, camera: str, device: str, target_hw: tuple[int, int]) -
     return rgb, depth
 
 
-def _init_optimizer_for_episode(optimizer: Optimizer, first_obs, camera: str, device: str) -> tuple[int, int]:
+def _init_optimizer_for_episode(
+    optimizer: Optimizer,
+    first_obs,
+    camera: str,
+    device: str,
+    skip_init_pose_opt: bool = False,
+) -> tuple[int, int]:
     optimizer.reset_optimizer()
     cam = optimizer.cam2world_ns_ds
     tgt_h = int(cam.height.item() if isinstance(cam.height, torch.Tensor) else cam.height)
     tgt_w = int(cam.width.item() if isinstance(cam.width, torch.Tensor) else cam.width)
     rgb, depth = _obs_to_tensors(first_obs, camera, device, (tgt_h, tgt_w))
     optimizer.set_frame(rgb, optimizer.cam2world_ns_ds, depth)
-    optimizer.init_obj_pose()
+    if skip_init_pose_opt:
+        optimizer.initialized = True
+        optimizer.optimizer.is_initialized = True
+        print("[INFO] Skipping initial pose optimization; using raw clustered Gaussian priors.")
+    else:
+        optimizer.init_obj_pose()
     return tgt_h, tgt_w
 
 
@@ -127,6 +139,95 @@ def _tracking_loss_proxy(optimizer: Optimizer, use_depth: bool, use_rgb: bool) -
     if loss is None:
         return float("nan")
     return float(loss.detach().item())
+
+
+def _pose_step_metrics(before: torch.Tensor, after: torch.Tensor) -> dict[str, float]:
+    """Summarize per-group pose changes made by one optimizer step."""
+    before_cpu = before.detach().cpu()
+    after_cpu = after.detach().cpu()
+    metrics: dict[str, float] = {}
+    n = min(int(before_cpu.shape[0]), int(after_cpu.shape[0]))
+    for group_idx in range(n):
+        trans_before = before_cpu[group_idx, :3]
+        trans_after = after_cpu[group_idx, :3]
+        trans_delta = torch.linalg.norm(trans_after - trans_before).item()
+        trans_norm = torch.linalg.norm(trans_after).item()
+
+        q_before = before_cpu[group_idx, 3:]
+        q_after = after_cpu[group_idx, 3:]
+        q_before = q_before / torch.clamp(torch.linalg.norm(q_before), min=1e-8)
+        q_after = q_after / torch.clamp(torch.linalg.norm(q_after), min=1e-8)
+        dot = torch.clamp(torch.abs(torch.dot(q_before, q_after)), 0.0, 1.0)
+        rot_delta_rad = 2.0 * torch.acos(dot).item()
+
+        prefix = f"group_{group_idx:02d}_"
+        metrics[prefix + "step_trans_delta_m"] = float(trans_delta)
+        metrics[prefix + "trans_norm_m"] = float(trans_norm)
+        metrics[prefix + "step_rot_delta_rad"] = float(rot_delta_rad)
+    return metrics
+
+
+def _restore_group_poses(
+    optimizer: Optimizer,
+    source_part_deltas: torch.Tensor,
+    group_indices: list[int],
+) -> None:
+    """Restore selected groups and clear Adam momentum for those rows."""
+    if not group_indices:
+        return
+    with torch.no_grad():
+        current = optimizer.optimizer.part_deltas
+        source = source_part_deltas.to(current.device)
+        for group_idx in group_indices:
+            if 0 <= group_idx < current.shape[0] and group_idx < source.shape[0]:
+                current.data[group_idx].copy_(source[group_idx])
+
+        state = optimizer.optimizer.part_optimizer.state.get(current, {})
+        for state_name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            state_value = state.get(state_name)
+            if isinstance(state_value, torch.Tensor) and state_value.shape[:1] == current.shape[:1]:
+                for group_idx in group_indices:
+                    if 0 <= group_idx < state_value.shape[0]:
+                        state_value[group_idx].zero_()
+
+
+def _unreliable_groups_from_assignments(assignment_records: list[dict[str, object]]) -> list[int]:
+    groups: list[int] = []
+    for rec in assignment_records:
+        if bool(rec.get("ignored", False)):
+            try:
+                groups.append(int(rec["group"]))
+            except Exception:
+                continue
+    return groups
+
+
+def _update_last_reliable_part_deltas(
+    last_reliable_part_deltas: torch.Tensor,
+    current_part_deltas: torch.Tensor,
+    assignment_records: list[dict[str, object]],
+    min_target_render_ratio: float,
+    min_iou: float,
+) -> list[int]:
+    """Update reliable pose memory from groups with strong current supervision."""
+    updated: list[int] = []
+    with torch.no_grad():
+        current = current_part_deltas.detach().to(last_reliable_part_deltas.device)
+        for rec in assignment_records:
+            try:
+                group_idx = int(rec["group"])
+                ratio = float(rec.get("target_render_ratio", 0.0))
+                iou = float(rec.get("iou", 0.0))
+            except Exception:
+                continue
+            if bool(rec.get("ignored", False)):
+                continue
+            if ratio < float(min_target_render_ratio) or iou < float(min_iou):
+                continue
+            if 0 <= group_idx < last_reliable_part_deltas.shape[0] and group_idx < current.shape[0]:
+                last_reliable_part_deltas[group_idx].copy_(current[group_idx])
+                updated.append(group_idx)
+    return updated
 
 
 def _load_workspace_bounds(task: str) -> tuple[np.ndarray, np.ndarray] | None:
@@ -215,6 +316,31 @@ def _write_image_sequence_video(image_dir: Path, out_path: Path, fps: float) -> 
     clip = mpy.ImageSequenceClip(frames, fps=float(fps))
     clip.write_videofile(str(out_path), logger=None)
     return str(out_path)
+
+
+def _save_rgb_resized(path: Path, rgb: np.ndarray, shape_hw: tuple[int, int]) -> None:
+    rgb_u8 = _to_uint8_rgb(np.asarray(rgb))
+    resized = Image.fromarray(rgb_u8).resize((int(shape_hw[1]), int(shape_hw[0])), resample=Image.NEAREST)
+    resized.save(path)
+
+
+def _render_current_tracking_rgb(optimizer: Optimizer) -> np.ndarray | None:
+    """Render current tracked Gaussians before/after an optimization step."""
+    with torch.no_grad(), optimizer.optimizer.render_lock:
+        optimizer.optimizer.pogs_model.eval()
+        optimizer.optimizer.apply_to_model(
+            optimizer.optimizer.part_deltas,
+            optimizer.group_labels,
+        )
+        outputs = optimizer.optimizer.pogs_model.get_outputs(
+            optimizer.cam2world_ns_ds.to("cuda"),
+            tracking=True,
+            rgb_only=True,
+        )
+        rgb = outputs.get("rgb")
+        if rgb is None:
+            return None
+        return _to_uint8_rgb(rgb.detach().cpu().numpy() if isinstance(rgb, torch.Tensor) else np.asarray(rgb))
 
 
 def _resize_bool_mask(mask: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
@@ -372,86 +498,330 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return 0.0 if union == 0 else float(inter / union)
 
 
+def _depth_to_numpy(depth_tensor: torch.Tensor | np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    depth = depth_tensor.detach().cpu().numpy() if isinstance(depth_tensor, torch.Tensor) else np.asarray(depth_tensor)
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    elif depth.ndim == 3 and depth.shape[0] == 1:
+        depth = depth[0]
+    depth = depth.astype(np.float32)
+    if depth.shape != shape_hw:
+        resized = Image.fromarray(depth).resize((shape_hw[1], shape_hw[0]), resample=Image.BILINEAR)
+        depth = np.asarray(resized, dtype=np.float32)
+    return depth
+
+
+def _save_depth_debug(path: Path, depth: np.ndarray, valid_mask: np.ndarray | None = None) -> None:
+    depth = np.asarray(depth, dtype=np.float32)
+    if valid_mask is None:
+        valid = np.isfinite(depth) & (depth > 0)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(depth) & (depth > 0)
+    if not bool(valid.any()):
+        Image.fromarray(np.zeros(depth.shape, dtype=np.uint8)).save(path)
+        return
+    lo, hi = np.nanpercentile(depth[valid], [2, 98])
+    if hi <= lo:
+        hi = lo + 1e-6
+    vis = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
+    vis[~valid] = 0.0
+    Image.fromarray((vis * 255.0).astype(np.uint8)).save(path)
+
+
+def _render_group_observables(
+    optimizer: Optimizer,
+    observed_depth_m: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[dict[str, float]]]:
+    """Render current group masks/depths for assignment and debug.
+
+    Depth returned by the POGS renderer is in dataset-scaled units; convert it to
+    metric depth to compare directly against RLBench / real depth images.
+    """
+    cam = optimizer.cam2world_ns_ds.to("cuda")
+    num_groups = int(optimizer.num_groups)
+    group_masks: list[np.ndarray] = []
+    group_depths_m: list[np.ndarray] = []
+    stats: list[dict[str, float]] = []
+    dataset_scale = float(getattr(optimizer.optimizer, "dataset_scale", 1.0))
+
+    with torch.no_grad(), optimizer.optimizer.render_lock:
+        optimizer.optimizer.pogs_model.eval()
+        optimizer.optimizer.apply_to_model(
+            optimizer.optimizer.part_deltas,
+            optimizer.group_labels,
+        )
+        for group_idx in range(num_groups):
+            outputs = optimizer.optimizer.pogs_model.get_outputs(
+                cam,
+                tracking=True,
+                obj_id=group_idx,
+                BLOCK_WIDTH=8,
+                rgb_only=False,
+            )
+            accum = outputs["accumulation"].squeeze(-1).detach().cpu().numpy()
+            depth = outputs["depth"].squeeze(-1).detach().cpu().numpy().astype(np.float32) / max(dataset_scale, 1e-8)
+            mask = accum > 0.9
+            if mask.shape != observed_depth_m.shape:
+                mask = _resize_bool_mask(mask, observed_depth_m.shape)
+                depth = np.asarray(
+                    Image.fromarray(depth).resize(
+                        (observed_depth_m.shape[1], observed_depth_m.shape[0]),
+                        resample=Image.BILINEAR,
+                    ),
+                    dtype=np.float32,
+                )
+            group_masks.append(mask.astype(bool))
+            group_depths_m.append(depth)
+
+            depth_valid = mask & np.isfinite(depth) & (depth > 0)
+            obs_valid = mask & np.isfinite(observed_depth_m) & (observed_depth_m > 0)
+            if bool(depth_valid.any()) and bool(obs_valid.any()):
+                depth_err = np.abs(depth[mask] - observed_depth_m[mask])
+                depth_err = depth_err[np.isfinite(depth_err)]
+                median_depth_err = float(np.median(depth_err)) if depth_err.size else float("nan")
+            else:
+                median_depth_err = float("nan")
+            stats.append(
+                {
+                    "group": float(group_idx),
+                    "render_area": float(mask.sum()),
+                    "render_depth_median": float(np.median(depth[depth_valid])) if bool(depth_valid.any()) else float("nan"),
+                    "obs_depth_median": float(np.median(observed_depth_m[obs_valid])) if bool(obs_valid.any()) else float("nan"),
+                    "median_abs_depth_err": median_depth_err,
+                }
+            )
+
+    return group_masks, group_depths_m, stats
+
+
+def _visible_gate_from_depth(
+    observed_depth_m: np.ndarray,
+    rendered_depth_m: np.ndarray,
+    rendered_mask: np.ndarray,
+    occlusion_margin_m: float,
+) -> np.ndarray:
+    observed = np.asarray(observed_depth_m, dtype=np.float32)
+    rendered = np.asarray(rendered_depth_m, dtype=np.float32)
+    mask = np.asarray(rendered_mask, dtype=bool)
+    valid = mask & np.isfinite(observed) & np.isfinite(rendered) & (observed > 0) & (rendered > 0)
+    visible = valid & (observed >= (rendered - float(occlusion_margin_m)))
+    return visible.astype(bool)
+
+
 def _assign_instance_masks_to_groups(
     optimizer: Optimizer,
     instance_masks: list[np.ndarray],
-    previous_assignments: list[int | None] | None,
+    previous_target_masks: list[np.ndarray] | None,
     min_iou: float,
+    group_masks: list[np.ndarray] | None = None,
+    group_depths_m: list[np.ndarray] | None = None,
+    observed_depth_m: np.ndarray | None = None,
+    depth_sigma_m: float = 0.05,
+    iou_weight: float = 1.0,
+    depth_weight: float = 0.4,
+    temporal_weight: float = 0.25,
+    occlusion_margin_m: float = 0.03,
+    min_depth_score: float = 0.15,
+    min_depth_valid_px: int = 25,
+    min_target_area_px: int = 25,
+    min_target_render_ratio: float = 0.15,
+    use_depth_score: bool = True,
+    use_depth_gate: bool = True,
 ) -> tuple[list[np.ndarray], list[int | None], list[dict[str, object]]]:
     num_groups = optimizer.num_groups
     cam_h = optimizer.cam2world_ns_ds.height
     cam_w = optimizer.cam2world_ns_ds.width
     h = int(cam_h.item() if isinstance(cam_h, torch.Tensor) else cam_h)
     w = int(cam_w.item() if isinstance(cam_w, torch.Tensor) else cam_w)
-    render_camera = optimizer.cam2world_ns_ds.to("cuda")
 
-    group_masks: list[np.ndarray] = []
-    for group_idx in range(num_groups):
-        rendered = optimizer.optimizer.render_mask(render_camera, group_idx)
-        group_masks.append(rendered.squeeze().detach().cpu().numpy().astype(bool))
+    if group_masks is None:
+        render_camera = optimizer.cam2world_ns_ds.to("cuda")
+        group_masks = []
+        for group_idx in range(num_groups):
+            rendered = optimizer.optimizer.render_mask(render_camera, group_idx)
+            group_masks.append(rendered.squeeze().detach().cpu().numpy().astype(bool))
+    group_masks = [_resize_bool_mask(mask, (h, w)) for mask in group_masks]
+
+    if group_depths_m is not None:
+        group_depths_m = [_depth_to_numpy(depth, (h, w)) for depth in group_depths_m]
+    if observed_depth_m is not None:
+        observed_depth_m = _depth_to_numpy(observed_depth_m, (h, w))
+
+    def _pair_depth_terms(group_idx: int, inst_mask: np.ndarray) -> tuple[float, float, int]:
+        if (
+            not use_depth_score
+            or group_depths_m is None
+            or observed_depth_m is None
+            or group_idx >= len(group_depths_m)
+        ):
+            return 0.0, float("nan"), 0
+        overlap = group_masks[group_idx] & np.asarray(inst_mask, dtype=bool)
+        valid = (
+            overlap
+            & np.isfinite(observed_depth_m)
+            & np.isfinite(group_depths_m[group_idx])
+            & (observed_depth_m > 0)
+            & (group_depths_m[group_idx] > 0)
+        )
+        if not bool(valid.any()):
+            return 0.0, float("nan"), 0
+        err = np.abs(group_depths_m[group_idx][valid] - observed_depth_m[valid])
+        median_err = float(np.median(err))
+        depth_score = float(np.exp(-median_err / max(float(depth_sigma_m), 1e-6)))
+        return depth_score, median_err, int(valid.sum())
+
+    ignore_masks = [np.full(mask.shape, -1.0, dtype=np.float32) for mask in group_masks]
 
     if len(instance_masks) == 0:
-        records = [{"group": int(idx), "instance": None, "iou": 0.0} for idx in range(num_groups)]
-        return [mask.copy() for mask in group_masks], [None] * num_groups, records
+        records = [
+            {
+                "group": int(idx),
+                "instance": None,
+                "iou": 0.0,
+                "score": 0.0,
+                "depth_score": 0.0,
+                "median_depth_err_m": float("nan"),
+                "depth_valid_px": 0,
+                "prev_mask_iou": 0.0,
+                "render_area": int(group_masks[idx].sum()),
+                "visible_area": 0,
+                "target_area": 0,
+                "ignored": True,
+                "ignore_reason": "no_instances",
+            }
+            for idx in range(num_groups)
+        ]
+        return ignore_masks, [None] * num_groups, records
 
+    score_details: dict[tuple[int, int], dict[str, float]] = {}
     scores: list[tuple[float, int, int]] = []
     for group_idx, group_mask in enumerate(group_masks):
         for inst_idx, inst_mask in enumerate(instance_masks):
             iou = _mask_iou(group_mask, inst_mask)
-            scores.append((iou, group_idx, inst_idx))
+            depth_score, median_depth_err, depth_valid_px = _pair_depth_terms(group_idx, inst_mask)
+            prev_mask_iou = 0.0
+            if (
+                previous_target_masks is not None
+                and group_idx < len(previous_target_masks)
+                and previous_target_masks[group_idx] is not None
+            ):
+                prev_mask = np.asarray(previous_target_masks[group_idx])
+                prev_valid = prev_mask >= 0.0
+                if bool(prev_valid.any()):
+                    prev_mask_iou = _mask_iou(prev_mask > 0.5, inst_mask)
+            score = float(iou_weight) * iou + float(depth_weight) * depth_score + float(temporal_weight) * prev_mask_iou
+            score_details[(group_idx, inst_idx)] = {
+                "score": float(score),
+                "iou": float(iou),
+                "depth_score": float(depth_score),
+                "median_depth_err_m": float(median_depth_err),
+                "depth_valid_px": float(depth_valid_px),
+                "prev_mask_iou": float(prev_mask_iou),
+            }
+            scores.append((score, group_idx, inst_idx))
 
     assignments: list[int | None] = [None] * num_groups
     used_instances: set[int] = set()
 
-    if previous_assignments is not None:
-        for group_idx, prev_inst in enumerate(previous_assignments):
-            if prev_inst is None or prev_inst >= len(instance_masks) or prev_inst in used_instances:
-                continue
-            if _mask_iou(group_masks[group_idx], instance_masks[prev_inst]) >= min_iou:
-                assignments[group_idx] = prev_inst
-                used_instances.add(prev_inst)
-
-    for iou, group_idx, inst_idx in sorted(scores, reverse=True):
-        if iou < min_iou:
-            break
+    for score, group_idx, inst_idx in sorted(scores, reverse=True):
+        detail = score_details.get((group_idx, inst_idx), {})
+        iou_ok = float(detail.get("iou", 0.0)) >= min_iou
+        temporal_ok = float(detail.get("prev_mask_iou", 0.0)) >= min_iou
+        depth_ok = (
+            (not use_depth_score)
+            or (
+                float(detail.get("depth_score", 0.0)) >= float(min_depth_score)
+                and int(detail.get("depth_valid_px", 0)) >= int(min_depth_valid_px)
+            )
+        )
+        if not (iou_ok or temporal_ok) or not depth_ok:
+            continue
         if assignments[group_idx] is not None or inst_idx in used_instances:
             continue
         assignments[group_idx] = inst_idx
         used_instances.add(inst_idx)
 
-    inst_centroids = [_mask_centroid(mask) for mask in instance_masks]
-    for group_idx, group_mask in enumerate(group_masks):
-        if assignments[group_idx] is not None:
-            continue
-        group_centroid = _mask_centroid(group_mask)
-        if group_centroid is None:
-            continue
-        candidates = []
-        for inst_idx, inst_centroid in enumerate(inst_centroids):
-            if inst_idx in used_instances or inst_centroid is None:
-                continue
-            dist = float(np.hypot(group_centroid[0] - inst_centroid[0], group_centroid[1] - inst_centroid[1]))
-            candidates.append((dist, inst_idx))
-        if candidates:
-            _, inst_idx = min(candidates)
-            assignments[group_idx] = inst_idx
-            used_instances.add(inst_idx)
-
     assigned_masks: list[np.ndarray] = []
     assignment_records: list[dict[str, object]] = []
     for group_idx, inst_idx in enumerate(assignments):
+        ignored = False
+        ignore_reason = ""
         if inst_idx is None:
-            # Neutral target: do not push unmatched groups out of view.
-            assigned_masks.append(group_masks[group_idx].copy())
             best_iou = 0.0
+            detail = {
+                "score": 0.0,
+                "depth_score": 0.0,
+                "median_depth_err_m": float("nan"),
+                "depth_valid_px": 0.0,
+                "prev_mask_iou": 0.0,
+            }
+            visible_area = 0
+            target_area = 0
+            target = ignore_masks[group_idx]
+            ignored = True
+            ignore_reason = "unmatched"
         else:
-            assigned_masks.append(instance_masks[inst_idx].astype(bool))
+            target = instance_masks[inst_idx].astype(bool)
             best_iou = _mask_iou(group_masks[group_idx], instance_masks[inst_idx])
+            detail = score_details.get((group_idx, inst_idx), {})
+            if (
+                use_depth_gate
+                and group_depths_m is not None
+                and observed_depth_m is not None
+                and group_idx < len(group_depths_m)
+            ):
+                visible_gate = _visible_gate_from_depth(
+                    observed_depth_m=observed_depth_m,
+                    rendered_depth_m=group_depths_m[group_idx],
+                    rendered_mask=group_masks[group_idx],
+                    occlusion_margin_m=occlusion_margin_m,
+                )
+                target = target & visible_gate
+                visible_area = int(visible_gate.sum())
+            else:
+                visible_gate = group_masks[group_idx]
+                visible_area = int(visible_gate.sum())
+            target_area = int(target.sum())
+            render_area = int(group_masks[group_idx].sum())
+            target_render_ratio = (
+                float(target_area) / float(max(render_area, 1))
+            )
+            if target_area == 0:
+                target = ignore_masks[group_idx]
+                ignored = True
+                ignore_reason = "depth_gated_empty"
+            elif (
+                target_area < int(min_target_area_px)
+                or target_render_ratio < float(min_target_render_ratio)
+            ):
+                target = ignore_masks[group_idx]
+                ignored = True
+                ignore_reason = "target_too_small"
+            else:
+                target = target.astype(np.float32)
+        render_area = int(group_masks[group_idx].sum())
+        target_render_ratio = (
+            float(target_area) / float(max(render_area, 1))
+            if render_area > 0
+            else 0.0
+        )
+        assigned_masks.append(target)
         assignment_records.append(
             {
                 "group": int(group_idx),
                 "instance": None if inst_idx is None else int(inst_idx),
                 "iou": float(best_iou),
+                "score": float(detail.get("score", 0.0)),
+                "depth_score": float(detail.get("depth_score", 0.0)),
+                "median_depth_err_m": float(detail.get("median_depth_err_m", float("nan"))),
+                "depth_valid_px": int(detail.get("depth_valid_px", 0)),
+                "prev_mask_iou": float(detail.get("prev_mask_iou", 0.0)),
+                "render_area": int(group_masks[group_idx].sum()),
+                "visible_area": int(visible_area),
+                "target_area": int(target_area),
+                "target_render_ratio": float(target_render_ratio),
+                "ignored": bool(ignored),
+                "ignore_reason": ignore_reason,
             }
         )
 
@@ -524,6 +894,15 @@ def main() -> None:
     parser.add_argument("--first-niters", type=int, default=15)
     parser.add_argument("--niters", type=int, default=5)
     parser.add_argument(
+        "--skip-init-pose-opt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Keep raw clustered Gaussian poses instead of running init_obj_pose(). "
+            "Default: true for gdino-sam2 mask/depth tracking, false otherwise."
+        ),
+    )
+    parser.add_argument(
         "--seg-mode",
         choices=["none", "gdino-sam2"],
         default="gdino-sam2",
@@ -532,6 +911,7 @@ def main() -> None:
     parser.add_argument("--seg-prompt", type=str, default="stacked blocks. blocks. cubes.")
     parser.add_argument(
         "--seg-extra-prompt",
+        "--extra-prompt",
         action="append",
         default=[],
         help="Additional segmentation prompt. You can also separate prompts with '|'.",
@@ -550,8 +930,8 @@ def main() -> None:
     parser.add_argument(
         "--seg-exclude-robot-mask",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use RLBench object-ID masks to remove Panda/gripper pixels from segmentation masks.",
+        default=False,
+        help="DEBUG ONLY: use RLBench object-ID masks to remove Panda/gripper pixels. Off by default because it is not deployable.",
     )
     parser.add_argument(
         "--seg-robot-overlap-drop-threshold",
@@ -565,6 +945,75 @@ def main() -> None:
         default=16,
         help="Drop segmentation instances smaller than this after robot-mask subtraction.",
     )
+    parser.add_argument(
+        "--seg-depth-aware-assignment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Assign SAM2 instances to Gaussian groups using rendered-mask overlap plus depth consistency.",
+    )
+    parser.add_argument(
+        "--seg-depth-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove likely occluded pixels from per-group mask targets using observed-vs-rendered depth.",
+    )
+    parser.add_argument(
+        "--seg-depth-sigma-m",
+        type=float,
+        default=0.05,
+        help="Depth error scale in meters for assignment scoring.",
+    )
+    parser.add_argument(
+        "--seg-occlusion-margin-m",
+        type=float,
+        default=0.03,
+        help="Observed depth must be at least rendered_depth - this margin to supervise a group pixel.",
+    )
+    parser.add_argument(
+        "--seg-min-depth-score",
+        type=float,
+        default=0.15,
+        help="Minimum depth-consistency score required before an instance can supervise a group.",
+    )
+    parser.add_argument(
+        "--seg-min-depth-valid-px",
+        type=int,
+        default=25,
+        help="Minimum overlap pixels with valid depth required before an instance can supervise a group.",
+    )
+    parser.add_argument(
+        "--seg-min-target-area-px",
+        type=int,
+        default=25,
+        help="Ignore a group for the frame if the final depth-gated target has fewer pixels than this.",
+    )
+    parser.add_argument(
+        "--seg-min-target-render-ratio",
+        type=float,
+        default=0.6,
+        help="Ignore a group for the frame if final target area / rendered group area is below this.",
+    )
+    parser.add_argument(
+        "--seg-rollback-unreliable-pose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore ignored/unreliable groups to their last reliable pose before optimization.",
+    )
+    parser.add_argument(
+        "--seg-reliable-target-render-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum target/render ratio required to update a group's last reliable pose memory.",
+    )
+    parser.add_argument(
+        "--seg-reliable-iou",
+        type=float,
+        default=0.7,
+        help="Minimum assignment IoU required to update a group's last reliable pose memory.",
+    )
+    parser.add_argument("--seg-iou-weight", type=float, default=1.0)
+    parser.add_argument("--seg-depth-weight", type=float, default=0.4)
+    parser.add_argument("--seg-temporal-weight", type=float, default=0.25)
     parser.add_argument(
         "--track-use-depth",
         action=argparse.BooleanOptionalAction,
@@ -616,8 +1065,11 @@ def main() -> None:
         help="Fail if pogs-config appears to be from a different episode.",
     )
     args = parser.parse_args()
+    if args.skip_init_pose_opt is None:
+        args.skip_init_pose_opt = args.seg_mode == "gdino-sam2"
 
     _set_seed(args.seed)
+    wp.init()
     rng = np.random.default_rng(args.seed)
 
     raw_root = Path(args.raw_root)
@@ -649,11 +1101,15 @@ def main() -> None:
     run_tag = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(args.out_dir) / args.task / f"ep_{args.episode}_seed_{args.seed}_{run_tag}"
     rgb_dir = run_dir / f"{args.camera}_rgb"
+    rgb_resized_dir = run_dir / f"{args.camera}_rgb_tracking_res"
+    preopt_tracked_rgb_dir = run_dir / "preopt_tracked_rgb"
     tracked_rgb_dir = run_dir / "tracked_rgb"
     depth_dir = run_dir / f"{args.camera}_depth"
     run_dir.mkdir(parents=True, exist_ok=True)
     if args.save_frames:
         rgb_dir.mkdir(parents=True, exist_ok=True)
+        rgb_resized_dir.mkdir(parents=True, exist_ok=True)
+        preopt_tracked_rgb_dir.mkdir(parents=True, exist_ok=True)
         tracked_rgb_dir.mkdir(parents=True, exist_ok=True)
         depth_dir.mkdir(parents=True, exist_ok=True)
     mask_dir = run_dir / "mask"
@@ -661,12 +1117,22 @@ def main() -> None:
     instance_mask_dir = run_dir / "instance_masks"
     assigned_mask_dir = run_dir / "assigned_group_masks"
     robot_mask_dir = run_dir / "robot_exclusion_mask"
+    render_group_mask_dir = run_dir / "rendered_group_masks"
+    visible_gate_dir = run_dir / "depth_visible_gates"
+    gated_mask_dir = run_dir / "depth_gated_group_masks"
+    render_depth_dir = run_dir / "rendered_group_depth"
+    observed_depth_vis_dir = run_dir / "observed_depth_vis"
     if args.save_seg_debug:
         mask_dir.mkdir(parents=True, exist_ok=True)
         mask_overlay_dir.mkdir(parents=True, exist_ok=True)
         instance_mask_dir.mkdir(parents=True, exist_ok=True)
         assigned_mask_dir.mkdir(parents=True, exist_ok=True)
         robot_mask_dir.mkdir(parents=True, exist_ok=True)
+        render_group_mask_dir.mkdir(parents=True, exist_ok=True)
+        visible_gate_dir.mkdir(parents=True, exist_ok=True)
+        gated_mask_dir.mkdir(parents=True, exist_ok=True)
+        render_depth_dir.mkdir(parents=True, exist_ok=True)
+        observed_depth_vis_dir.mkdir(parents=True, exist_ok=True)
 
     from rlbench.action_modes.action_mode import MoveArmThenGripper
     from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
@@ -702,6 +1168,8 @@ def main() -> None:
             print(f"[INFO] Collected {len(robot_handles)} Panda/gripper handles for robot masking.")
         except Exception as exc:
             print(f"[WARN] Failed to collect robot handles for masking: {exc}")
+    if args.seg_exclude_robot_mask:
+        print("[WARN] --seg-exclude-robot-mask uses simulator object IDs and is not deployable; prefer depth gating.")
 
     if args.hide_robot_from_camera:
         try:
@@ -773,7 +1241,13 @@ def main() -> None:
         if args.seg_mode == "gdino-sam2":
             # Keep initialization stable (no mask required there), then switch to mask-only tracking.
             optimizer.optimizer.config.use_mask_loss = False
-        target_h, target_w = _init_optimizer_for_episode(optimizer, obs, args.camera, device)
+        target_h, target_w = _init_optimizer_for_episode(
+            optimizer,
+            obs,
+            args.camera,
+            device,
+            skip_init_pose_opt=bool(args.skip_init_pose_opt),
+        )
         if args.seg_mode == "gdino-sam2":
             optimizer.optimizer.config.use_dino_loss = False
             optimizer.optimizer.config.use_mask_loss = True
@@ -785,7 +1259,8 @@ def main() -> None:
             f"task={args.task} episode={args.episode} seed={args.seed} steps={args.steps}"
         )
 
-        previous_assignments: list[int | None] | None = None
+        previous_target_masks: list[np.ndarray] | None = None
+        last_reliable_part_deltas = optimizer.optimizer.part_deltas.detach().clone()
 
         for step_idx in range(int(args.steps)):
             rgb_tensor, depth_tensor = _obs_to_tensors(obs, args.camera, device, (target_h, target_w))
@@ -795,6 +1270,10 @@ def main() -> None:
             instance_masks: list[np.ndarray] = []
             assignment_records: list[dict[str, object]] = []
             robot_exclusion_mask = None
+            group_render_masks: list[np.ndarray] = []
+            group_render_depths_m: list[np.ndarray] = []
+            group_render_stats: list[dict[str, float]] = []
+            observed_depth_m = _depth_to_numpy(depth_tensor, (target_h, target_w))
             seg_filter_record: dict[str, object] = {
                 "enabled": False,
                 "dropped_instances": 0,
@@ -803,6 +1282,10 @@ def main() -> None:
             if masker is not None:
                 rgb_np = _to_uint8_rgb(rgb_tensor.detach().cpu().numpy())
                 obj_mask, seg_boxes, instance_masks = masker.predict(rgb_np)
+                group_render_masks, group_render_depths_m, group_render_stats = _render_group_observables(
+                    optimizer=optimizer,
+                    observed_depth_m=observed_depth_m,
+                )
                 if args.seg_exclude_robot_mask:
                     robot_exclusion_mask = _robot_exclusion_mask_from_obs(
                         obs=obs,
@@ -822,11 +1305,37 @@ def main() -> None:
                         if instance_masks
                         else np.zeros(rgb_np.shape[:2], dtype=bool)
                     )
-                group_obj_masks, previous_assignments, assignment_records = _assign_instance_masks_to_groups(
+                group_obj_masks, current_assignments, assignment_records = _assign_instance_masks_to_groups(
                     optimizer=optimizer,
                     instance_masks=instance_masks,
-                    previous_assignments=previous_assignments,
+                    previous_target_masks=previous_target_masks,
                     min_iou=float(args.seg_assignment_min_iou),
+                    group_masks=group_render_masks,
+                    group_depths_m=group_render_depths_m,
+                    observed_depth_m=observed_depth_m,
+                    depth_sigma_m=float(args.seg_depth_sigma_m),
+                    iou_weight=float(args.seg_iou_weight),
+                    depth_weight=float(args.seg_depth_weight),
+                    temporal_weight=float(args.seg_temporal_weight),
+                    occlusion_margin_m=float(args.seg_occlusion_margin_m),
+                    min_depth_score=float(args.seg_min_depth_score),
+                    min_depth_valid_px=int(args.seg_min_depth_valid_px),
+                    min_target_area_px=int(args.seg_min_target_area_px),
+                    min_target_render_ratio=float(args.seg_min_target_render_ratio),
+                    use_depth_score=bool(args.seg_depth_aware_assignment),
+                    use_depth_gate=bool(args.seg_depth_gate),
+                )
+                previous_target_masks = [np.asarray(mask).copy() for mask in group_obj_masks]
+            pose_rollback_groups = (
+                _unreliable_groups_from_assignments(assignment_records)
+                if bool(args.seg_rollback_unreliable_pose)
+                else []
+            )
+            if pose_rollback_groups:
+                _restore_group_poses(
+                    optimizer,
+                    last_reliable_part_deltas,
+                    pose_rollback_groups,
                 )
             optimizer.set_observation(
                 rgb_tensor,
@@ -841,10 +1350,30 @@ def main() -> None:
                 use_rgb=bool(args.track_use_rgb),
             )
 
+            preopt_render_rgb = _render_current_tracking_rgb(optimizer) if args.save_frames else None
+            pose_deltas_before_step = optimizer.optimizer.part_deltas.detach().clone()
+
             step_render_dict = optimizer.step_opt(
                 niter=args.first_niters if step_idx == 0 else args.niters,
                 use_depth=bool(args.track_use_depth),
                 use_rgb=bool(args.track_use_rgb),
+            )
+            pose_step_metrics = _pose_step_metrics(
+                pose_deltas_before_step,
+                optimizer.optimizer.part_deltas.detach(),
+            )
+            if pose_rollback_groups:
+                _restore_group_poses(
+                    optimizer,
+                    last_reliable_part_deltas,
+                    pose_rollback_groups,
+                )
+            reliable_pose_updates = _update_last_reliable_part_deltas(
+                last_reliable_part_deltas=last_reliable_part_deltas,
+                current_part_deltas=optimizer.optimizer.part_deltas.detach(),
+                assignment_records=assignment_records,
+                min_target_render_ratio=float(args.seg_reliable_target_render_ratio),
+                min_iou=float(args.seg_reliable_iou),
             )
 
             step_metrics: dict[str, float] = {}
@@ -867,6 +1396,9 @@ def main() -> None:
             depth_frame = getattr(obs, f"{args.camera}_depth")
             if args.save_frames:
                 Image.fromarray(_to_uint8_rgb(np.asarray(rgb_frame))).save(rgb_dir / f"{step_idx:04d}.png")
+                _save_rgb_resized(rgb_resized_dir / f"{step_idx:04d}.png", np.asarray(rgb_frame), (target_h, target_w))
+                if preopt_render_rgb is not None:
+                    Image.fromarray(preopt_render_rgb).save(preopt_tracked_rgb_dir / f"{step_idx:04d}.png")
                 np.save(depth_dir / f"{step_idx:04d}.npy", np.asarray(depth_frame, dtype=np.float32))
                 if isinstance(step_render_dict, dict) and "rgb" in step_render_dict:
                     render_rgb = step_render_dict["rgb"]
@@ -890,11 +1422,41 @@ def main() -> None:
                 step_assigned_dir.mkdir(parents=True, exist_ok=True)
                 if group_obj_masks is not None:
                     for group_idx, group_mask in enumerate(group_obj_masks):
-                        Image.fromarray((group_mask.astype(np.uint8) * 255)).save(step_assigned_dir / f"{group_idx:02d}.png")
+                        Image.fromarray(((np.asarray(group_mask) > 0.5).astype(np.uint8) * 255)).save(step_assigned_dir / f"{group_idx:02d}.png")
                 if robot_exclusion_mask is not None:
                     Image.fromarray((robot_exclusion_mask.astype(np.uint8) * 255)).save(
                         robot_mask_dir / f"{step_idx:04d}.png"
                     )
+                _save_depth_debug(observed_depth_vis_dir / f"{step_idx:04d}.png", observed_depth_m)
+                step_render_mask_dir = render_group_mask_dir / f"{step_idx:04d}"
+                step_render_mask_dir.mkdir(parents=True, exist_ok=True)
+                step_visible_gate_dir = visible_gate_dir / f"{step_idx:04d}"
+                step_visible_gate_dir.mkdir(parents=True, exist_ok=True)
+                step_gated_mask_dir = gated_mask_dir / f"{step_idx:04d}"
+                step_gated_mask_dir.mkdir(parents=True, exist_ok=True)
+                step_render_depth_dir = render_depth_dir / f"{step_idx:04d}"
+                step_render_depth_dir.mkdir(parents=True, exist_ok=True)
+                for group_idx, render_mask in enumerate(group_render_masks):
+                    Image.fromarray((render_mask.astype(np.uint8) * 255)).save(step_render_mask_dir / f"{group_idx:02d}.png")
+                    if group_idx < len(group_render_depths_m):
+                        _save_depth_debug(
+                            step_render_depth_dir / f"{group_idx:02d}.png",
+                            group_render_depths_m[group_idx],
+                            valid_mask=render_mask,
+                        )
+                        visible_gate = _visible_gate_from_depth(
+                            observed_depth_m=observed_depth_m,
+                            rendered_depth_m=group_render_depths_m[group_idx],
+                            rendered_mask=render_mask,
+                            occlusion_margin_m=float(args.seg_occlusion_margin_m),
+                        )
+                        Image.fromarray((visible_gate.astype(np.uint8) * 255)).save(
+                            step_visible_gate_dir / f"{group_idx:02d}.png"
+                        )
+                        if group_obj_masks is not None and group_idx < len(group_obj_masks):
+                            Image.fromarray(((np.asarray(group_obj_masks[group_idx]) > 0.5).astype(np.uint8) * 255)).save(
+                                step_gated_mask_dir / f"{group_idx:02d}.png"
+                            )
 
             row: dict[str, object] = {
                 "step": int(step_idx),
@@ -913,8 +1475,16 @@ def main() -> None:
                 "seg_num_boxes": int(len(seg_boxes)),
                 "seg_boxes": seg_boxes,
                 "seg_num_instances": int(len(instance_masks)),
+                "seg_ignored_groups": int(sum(1 for rec in assignment_records if rec.get("ignored"))),
                 "seg_filter": seg_filter_record,
                 "seg_assignments": assignment_records,
+                "seg_render_group_stats": group_render_stats,
+                "per_group_loss_metrics": {
+                    key: value for key, value in step_metrics.items() if key.startswith("group_")
+                },
+                "per_group_pose_step_metrics": pose_step_metrics,
+                "pose_rollback_groups": [int(g) for g in pose_rollback_groups],
+                "reliable_pose_update_groups": [int(g) for g in reliable_pose_updates],
             }
 
             if step_idx == int(args.steps) - 1:
@@ -962,12 +1532,24 @@ def main() -> None:
             rollout_rows.append(row)
 
             if step_idx % verify_every == 0:
+                mean_iou = float(np.mean([float(r.get("iou", 0.0)) for r in assignment_records])) if assignment_records else 0.0
+                mean_depth_err = [
+                    float(r.get("median_depth_err_m", float("nan")))
+                    for r in assignment_records
+                    if np.isfinite(float(r.get("median_depth_err_m", float("nan"))))
+                ]
+                mean_depth_err_val = float(np.mean(mean_depth_err)) if mean_depth_err else float("nan")
+                total_visible = int(sum(int(r.get("visible_area", 0)) for r in assignment_records))
                 print(
                     "[VERIFY] "
                     f"step={step_idx:03d} "
                     f"total={float(row['opt_total_loss_last']):.6f} "
                     f"mask_bce={float(row['opt_mask_bce_loss_last']):.6f} "
                     f"instances={int(row['seg_num_instances'])} "
+                    f"ignored={int(row['seg_ignored_groups'])} "
+                    f"assign_iou={mean_iou:.3f} "
+                    f"depth_err_m={mean_depth_err_val:.4f} "
+                    f"visible_px={total_visible} "
                     f"robot_dropped={int(seg_filter_record.get('dropped_instances', 0))} "
                     f"reward={float(reward):.3f} "
                     f"terminate={bool(terminate)}"
@@ -1000,6 +1582,22 @@ def main() -> None:
                 if rgb_video:
                     video_paths[f"{args.camera}_rgb"] = rgb_video
 
+                rgb_resized_video = _write_image_sequence_video(
+                    rgb_resized_dir,
+                    run_dir / f"{args.camera}_rgb_tracking_res.mp4",
+                    video_fps,
+                )
+                if rgb_resized_video:
+                    video_paths[f"{args.camera}_rgb_tracking_res"] = rgb_resized_video
+
+                preopt_video = _write_image_sequence_video(
+                    preopt_tracked_rgb_dir,
+                    run_dir / "preopt_tracked_rgb.mp4",
+                    video_fps,
+                )
+                if preopt_video:
+                    video_paths["preopt_tracked_rgb"] = preopt_video
+
                 tracked_video = _write_image_sequence_video(tracked_rgb_dir, run_dir / "tracked_rgb.mp4", video_fps)
                 if tracked_video:
                     video_paths["tracked_rgb"] = tracked_video
@@ -1028,6 +1626,7 @@ def main() -> None:
             "termination_reason": termination_reason,
             "track_use_depth": bool(args.track_use_depth),
             "track_use_rgb": bool(args.track_use_rgb),
+            "hide_robot_from_camera": bool(args.hide_robot_from_camera),
             "seg_mode": args.seg_mode,
             "seg_prompt": args.seg_prompt,
             "seg_extra_prompt": list(args.seg_extra_prompt),
@@ -1035,13 +1634,30 @@ def main() -> None:
             "seg_exclude_robot_mask": bool(args.seg_exclude_robot_mask),
             "seg_robot_overlap_drop_threshold": float(args.seg_robot_overlap_drop_threshold),
             "seg_min_instance_area_px": int(args.seg_min_instance_area_px),
+            "seg_depth_aware_assignment": bool(args.seg_depth_aware_assignment),
+            "seg_depth_gate": bool(args.seg_depth_gate),
+            "seg_depth_sigma_m": float(args.seg_depth_sigma_m),
+            "seg_occlusion_margin_m": float(args.seg_occlusion_margin_m),
+            "seg_min_depth_score": float(args.seg_min_depth_score),
+            "seg_min_depth_valid_px": int(args.seg_min_depth_valid_px),
+            "seg_min_target_area_px": int(args.seg_min_target_area_px),
+            "seg_min_target_render_ratio": float(args.seg_min_target_render_ratio),
+            "seg_rollback_unreliable_pose": bool(args.seg_rollback_unreliable_pose),
+            "seg_reliable_target_render_ratio": float(args.seg_reliable_target_render_ratio),
+            "seg_reliable_iou": float(args.seg_reliable_iou),
+            "seg_iou_weight": float(args.seg_iou_weight),
+            "seg_depth_weight": float(args.seg_depth_weight),
+            "seg_temporal_weight": float(args.seg_temporal_weight),
             "first_niters": int(args.first_niters),
             "niters": int(args.niters),
+            "skip_init_pose_opt": bool(args.skip_init_pose_opt),
             "tracking_2d_signal": {
                 "checks": int(len(finite_rows)),
                 "improve_rate": improve_rate,
             },
             "frames_dir": str(rgb_dir) if args.save_frames else "",
+            "frames_tracking_res_dir": str(rgb_resized_dir) if args.save_frames else "",
+            "preopt_tracked_frames_dir": str(preopt_tracked_rgb_dir) if args.save_frames else "",
             "tracked_frames_dir": str(tracked_rgb_dir) if args.save_frames else "",
             "depth_dir": str(depth_dir) if args.save_frames else "",
             "mask_dir": str(mask_dir) if args.save_seg_debug else "",
@@ -1049,6 +1665,11 @@ def main() -> None:
             "instance_mask_dir": str(instance_mask_dir) if args.save_seg_debug else "",
             "assigned_mask_dir": str(assigned_mask_dir) if args.save_seg_debug else "",
             "robot_mask_dir": str(robot_mask_dir) if args.save_seg_debug else "",
+            "render_group_mask_dir": str(render_group_mask_dir) if args.save_seg_debug else "",
+            "visible_gate_dir": str(visible_gate_dir) if args.save_seg_debug else "",
+            "gated_mask_dir": str(gated_mask_dir) if args.save_seg_debug else "",
+            "render_depth_dir": str(render_depth_dir) if args.save_seg_debug else "",
+            "observed_depth_vis_dir": str(observed_depth_vis_dir) if args.save_seg_debug else "",
             "video_paths": video_paths,
             "rows": rollout_rows,
         }
@@ -1060,6 +1681,8 @@ def main() -> None:
         print(f"[INFO] Saved rollout report: {out_json}")
         if args.save_frames:
             print(f"[INFO] Saved RGB frames: {rgb_dir}")
+            print(f"[INFO] Saved tracking-res RGB frames: {rgb_resized_dir}")
+            print(f"[INFO] Saved pre-optimization tracked renders: {preopt_tracked_rgb_dir}")
             print(f"[INFO] Saved tracked renders: {tracked_rgb_dir}")
             print(f"[INFO] Saved depth frames: {depth_dir}")
         for name, path in video_paths.items():

@@ -342,14 +342,27 @@ class RigidGroupOptimizer:
                     out_mask = (outputs['accumulation'] > 0.85)
                     if not bool(out_mask.any().item()):
                         # This rigid group is currently out of view; skip it for this optimization step.
+                        loss_terms[f"group_{i:02d}_visible"] = 0.0
+                        loss_terms[f"group_{i:02d}_render_area"] = 0.0
                         continue
                     visible_obj_count += 1
+                    loss_terms[f"group_{i:02d}_visible"] = 1.0
+                    loss_terms[f"group_{i:02d}_render_area"] = float(out_mask.detach().sum().item())
                                             
                     valids = (out_mask.squeeze(-1) & (~frame.roi_frames[i].depth.isnan().squeeze(-1)))
                     
                     feats_dict["real_rgb"].append(frame.roi_frames[i].rgb)
                     if use_depth:
                         real_depth = frame.roi_frames[i].depth
+                        mask_gate = None
+                        if use_mask:
+                            try:
+                                roi_mask = frame.roi_frames[i].mask.squeeze(-1)
+                                mask_gate = roi_mask > 0.5
+                            except Exception:
+                                mask_gate = None
+                        if mask_gate is not None:
+                            valids = valids & mask_gate
                         valid_depths = kornia.morphology.erosion(
                             valids.unsqueeze(0).unsqueeze(0).to(float),
                             torch.ones(5, 5, device=valids.device),
@@ -382,19 +395,58 @@ class RigidGroupOptimizer:
                         feats_dict['valids'].append(valids.unsqueeze(-1))
                         feats_dict["real_depth"].append(masked_depth)
                         feats_dict["rendered_depth"].append(masked_depth_rendered)
+                        group_valid = valids.unsqueeze(-1).to(bool)
+                        depth_valid_count = int(group_valid.sum().detach().item())
+                        loss_terms[f"group_{i:02d}_depth_valid_count"] = float(depth_valid_count)
+                        if depth_valid_count > 0:
+                            group_rendered_depth = (masked_depth_rendered / self.dataset_scale)[group_valid]
+                            group_real_depth = masked_depth[group_valid]
+                            group_depth_sq = (torch.clamp(group_rendered_depth, min=1e-8) - torch.clamp(group_real_depth, min=1e-8)) ** 2
+                            group_depth_sq_thresh = group_depth_sq[
+                                group_depth_sq < self.config.depth_ignore_threshold**2
+                            ]
+                            if group_depth_sq_thresh.numel() == 0:
+                                group_depth_sq_thresh = group_depth_sq
+                            if group_depth_sq_thresh.numel() > 0:
+                                loss_terms[f"group_{i:02d}_depth_loss"] = float(group_depth_sq_thresh.mean().detach().item())
+                                loss_terms[f"group_{i:02d}_depth_abs_err_median"] = float(
+                                    (group_rendered_depth - group_real_depth).abs().median().detach().item()
+                                )
+                        else:
+                            loss_terms[f"group_{i:02d}_depth_loss"] = float("nan")
+                            loss_terms[f"group_{i:02d}_depth_abs_err_median"] = float("nan")
 
                     else:
                         feats_dict['valids'].append(kornia.morphology.erosion(valids.unsqueeze(0).unsqueeze(0).to(float),torch.ones(9,9, device=valids.device)).to(bool).squeeze(0).permute(1,2,0))
                     
                     if use_mask:
-                        feats_dict["real_mask"].append((frame.roi_frames[i].mask.to(torch.float32)).unsqueeze(-1))
+                        group_mask = (frame.roi_frames[i].mask.to(torch.float32)).unsqueeze(-1)
+                        feats_dict["real_mask"].append(group_mask)
+                        mask_valids = group_mask >= 0.0
+                        loss_terms[f"group_{i:02d}_mask_valid_count"] = float(mask_valids.sum().detach().item())
+                        if bool(mask_valids.any().item()):
+                            group_mask_target = group_mask.clamp(0.0, 1.0)
+                            group_mask_loss = F.binary_cross_entropy(
+                                outputs["accumulation"][mask_valids],
+                                group_mask_target[mask_valids],
+                            )
+                            loss_terms[f"group_{i:02d}_mask_bce_loss"] = float(group_mask_loss.detach().item())
+                        else:
+                            loss_terms[f"group_{i:02d}_mask_bce_loss"] = float("nan")
                         
                     if use_dino:
                         dino_feats = frame.roi_frames[i].dino_feats.to(camera.device)
                         feats_dict["real_dino"].append(dino_feats)
                     feats_dict["rendered_rgb"].append(outputs['rgb'])
                     if use_dino:
-                        feats_dict["rendered_dino"].append(self.blur(outputs['dino'].permute(2,0,1)[None]).squeeze().permute(1,2,0))
+                        rendered_dino = self.blur(outputs['dino'].permute(2,0,1)[None]).squeeze().permute(1,2,0)
+                        feats_dict["rendered_dino"].append(rendered_dino)
+                        group_dino_delta = (dino_feats - rendered_dino).norm(dim=-1)
+                        loss_terms[f"group_{i:02d}_dino_loss_all"] = float(group_dino_delta.nanmean().detach().item())
+                        if bool(valids.any().item()):
+                            loss_terms[f"group_{i:02d}_dino_loss_valid"] = float(group_dino_delta[valids].nanmean().detach().item())
+                        else:
+                            loss_terms[f"group_{i:02d}_dino_loss_valid"] = float("nan")
                         
                     accum = outputs['accumulation']
                     feats_dict["accumulation"].append(accum.to(torch.float32))                    
@@ -445,11 +497,21 @@ class RigidGroupOptimizer:
                 loss_terms["depth_valid_count"] = float(pix_loss.numel())
                 _add_loss(self.config.depth_loss_mult * depth_loss)
         if use_mask and "real_mask" in feats_dict:
-            mask_bce_loss = F.binary_cross_entropy(feats_dict["accumulation"], feats_dict["real_mask"])
-            if self.use_wandb:
-                wandb.log({"mask_bce_loss": mask_bce_loss.mean().item()})
-            loss_terms["mask_bce_loss"] = float(mask_bce_loss.detach().item())
-            _add_loss(0.6 * mask_bce_loss)
+            real_mask = feats_dict["real_mask"]
+            mask_valids = real_mask >= 0.0
+            if bool(mask_valids.any().item()):
+                mask_target = real_mask.clamp(0.0, 1.0)
+                mask_bce_loss = F.binary_cross_entropy(
+                    feats_dict["accumulation"][mask_valids],
+                    mask_target[mask_valids],
+                )
+                if self.use_wandb:
+                    wandb.log({"mask_bce_loss": mask_bce_loss.mean().item()})
+                loss_terms["mask_bce_loss"] = float(mask_bce_loss.detach().item())
+                loss_terms["mask_valid_count"] = float(mask_valids.sum().detach().item())
+                _add_loss(0.6 * mask_bce_loss)
+            else:
+                loss_terms["mask_valid_count"] = 0.0
         
         if use_atap:
             weights = torch.ones(len(self.group_masks), len(self.group_masks),dtype=torch.float32,device='cuda')
